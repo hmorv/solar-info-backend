@@ -87,23 +87,98 @@ app.get('/api/solar/history', async (req, res) => {
 
   try {
     const conn = await mysql.createConnection(dbConfig);
-
-    const [rows] = await conn.execute(
-      `SELECT timestamp, \`${param}\` as value
-       FROM solar_readings
-       WHERE timestamp >= ?
-       ORDER BY timestamp ASC`,
-      [since.toISOString().slice(0, 19).replace('T', ' ')]
-    );
+    let sampledRows = [];
+    if (range === '3d') {
+      // Consulta optimizada para 3 días (864 registros totales)
+      const [[{ total }]] = await conn.execute(
+        `SELECT COUNT(*) as total FROM solar_readings WHERE timestamp >= ?`,
+        [since.toISOString().slice(0, 19).replace('T', ' ')]
+      );
+      const step = Math.ceil(total / 432);
+      const [rows] = await conn.execute(
+        `SELECT timestamp, \`${param}\` as value
+         FROM (
+           SELECT *, ROW_NUMBER() OVER (ORDER BY timestamp ASC) as rn
+           FROM solar_readings
+           WHERE timestamp >= ?
+         ) t
+         WHERE MOD(rn - 1, ?) = 0
+         ORDER BY timestamp ASC`,
+        [since.toISOString().slice(0, 19).replace('T', ' '), step]
+      );
+      sampledRows = rows;
+    } else if (range === '7d') {
+      // Consulta optimizada para 7 días (2016 registros totales)
+      const [[{ total }]] = await conn.execute(
+        `SELECT COUNT(*) as total FROM solar_readings WHERE timestamp >= ?`,
+        [since.toISOString().slice(0, 19).replace('T', ' ')]
+      );
+      const step = Math.ceil(total / 1008);
+      const [rows] = await conn.execute(
+        `SELECT timestamp, \`${param}\` as value
+         FROM (
+           SELECT *, ROW_NUMBER() OVER (ORDER BY timestamp ASC) as rn
+           FROM solar_readings
+           WHERE timestamp >= ?
+         ) t
+         WHERE MOD(rn - 1, ?) = 0
+         ORDER BY timestamp ASC`,
+        [since.toISOString().slice(0, 19).replace('T', ' '), step]
+      );
+      sampledRows = rows;
+    } else {
+      // Para 24h, trae todo
+      const [rows] = await conn.execute(
+        `SELECT timestamp, \`${param}\` as value
+         FROM solar_readings
+         WHERE timestamp >= ?
+         ORDER BY timestamp ASC`,
+        [since.toISOString().slice(0, 19).replace('T', ' ')]
+      );
+      sampledRows = rows;
+    }
 
     await conn.end();
 
-    // Redondear los valores numéricos en cada fila
-    rows.forEach(row => {
+    sampledRows.forEach(row => {
       roundFields(row, ['value'], 2);
     });
 
-    res.json(rows);
+    res.json(sampledRows);
+
+    // const [rows] = await conn.execute(
+    //   `SELECT timestamp, \`${param}\` as value
+    //    FROM solar_readings
+    //    WHERE timestamp >= ?
+    //    ORDER BY timestamp ASC`,
+    //   [since.toISOString().slice(0, 19).replace('T', ' ')]
+    // );
+
+    // await conn.end();
+
+    // Redondear los valores numéricos en cada fila
+    // rows.forEach(row => {
+    //   roundFields(row, ['value'], 2);
+    // });
+
+    // Downsampling según rango
+    // let sampledRows = rows;
+    // if (range === '3d' && rows.length > 400) {
+    //   const step = Math.floor(rows.length / 400);
+    //   sampledRows = rows.filter((_, idx) => idx % step === 0);
+    //   if (sampledRows[sampledRows.length - 1] !== rows[rows.length - 1]) {
+    //     sampledRows.push(rows[rows.length - 1]);
+    //   }
+    // } else if (range === '7d' && rows.length > 600) {
+    //   const step = Math.floor(rows.length / 600);
+    //   sampledRows = rows.filter((_, idx) => idx % step === 0);
+    //   if (sampledRows[sampledRows.length - 1] !== rows[rows.length - 1]) {
+    //     sampledRows.push(rows[rows.length - 1]);
+    //   }
+    // }
+    // Para 24h, no se limita
+
+    // res.json(rows);
 
   } catch (err) {
     console.error(err);
