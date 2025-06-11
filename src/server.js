@@ -94,7 +94,7 @@ app.get('/api/solar/history', async (req, res) => {
         `SELECT COUNT(*) as total FROM solar_readings WHERE timestamp >= ?`,
         [since.toISOString().slice(0, 19).replace('T', ' ')]
       );
-      const step = Math.ceil(total / 432);
+      const step = Math.ceil(total / 72); // 864 / 72 = 12 registros (salto de 1 hora)
       const [rows] = await conn.execute(
         `SELECT timestamp, \`${param}\` as value
          FROM (
@@ -113,7 +113,7 @@ app.get('/api/solar/history', async (req, res) => {
         `SELECT COUNT(*) as total FROM solar_readings WHERE timestamp >= ?`,
         [since.toISOString().slice(0, 19).replace('T', ' ')]
       );
-      const step = Math.ceil(total / 1008);
+      const step = Math.ceil(total / 168); // 2016 / 168 = 12 registros (salto de 1 hora)
       const [rows] = await conn.execute(
         `SELECT timestamp, \`${param}\` as value
          FROM (
