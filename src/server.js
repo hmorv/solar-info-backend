@@ -72,7 +72,7 @@ app.get('/api/solar/history', async (req, res) => {
   // Validación rápida
   const allowedParams = [
     'solar_flux', 'sunspots', 'a_index', 'k_index', 'helium_line', 'proton_flux',
-    'electron_flux', 'aurora', 'lat_degree', 'solar_wind', 'normalization', 'magnetic_field', 'k_index_nt'
+    'electron_flux', 'aurora', 'lat_degree', 'solar_wind', 'normalization', 'magnetic_field', 'k_index_nt', 'x_ray'
   ];
   if (!allowedParams.includes(param)) {
     return res.status(400).json({ error: 'Invalid param' });
