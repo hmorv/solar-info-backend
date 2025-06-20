@@ -1,15 +1,44 @@
+require('dotenv').config(); // Carga las variables de entorno
+
 const express = require('express');
 const mysql = require('mysql2/promise');
+const fs = require('fs'); // ✅ Añadido
+const morgan = require('morgan');
+
 const app = express();
+app.set('trust proxy', true);
+app.disable('x-powered-by');
+
 const PORT = 3000;
 const HOST = '127.0.0.1';
 
 const dbConfig = {
-  host: 'localhost',
-  user: 'dxsun',
-  password: 'Los pajaros de plomo no vuelan tan bien como los de carne y hueso.',
-  database: 'dxsun'
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'dxsun',
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME || 'dxsun'
 };
+
+const rateLimit = require('express-rate-limit');
+
+const limiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minuto
+  max: 60, // 60 peticiones por minuto
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+
+app.use(limiter);
+
+// 📄 Crear stream de logs
+const accessLogStream = fs.createWriteStream('/home/hugo/dxsun/solar-api-access.log', { flags: 'a' });
+
+// 👉 Log personalizado con IP real y timestamp ISO
+app.use(morgan(
+  ':remote-addr - :remote-user [:date[iso]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"',
+  { stream: accessLogStream }
+));
 
 app.get('/api/solar/last', async (req, res) => {
   console.log("➡️ Recibida petición GET /api/solar/last");

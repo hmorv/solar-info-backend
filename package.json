@@ -9,7 +9,10 @@
   "author": "Hugo Moragues <hugo.moragues@gmail.com>",
   "license": "ISC",
   "dependencies": {
+    "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "morgan": "^1.10.0",
     "mysql2": "^3.14.1",
     "xml2js": "^0.6.2"
   }
