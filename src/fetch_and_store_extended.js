@@ -47,7 +47,7 @@ async function parseAndStore() {
       d.xray || null,
       (d.sunspots !== undefined && d.sunspots !== null && d.sunspots !== '') ? parseInt(d.sunspots) : null,
       (d.heliumline !== undefined && d.heliumline !== null && d.heliumline !== '') ? parseFloat(d.heliumline) : null,
-      (d.protonflux !== undefined && d.protonflux !== null && d.protonflux !== '') ? parseFloat(d.protonflux) : null,
+      (isFinite(d.protonflux) || /^\d+(\.\d+)?(e[+-]?\d+)?$/i.test(d.protonflux)) ? parseFloat(d.protonflux) : null,
       (d.electonflux !== undefined && d.electonflux !== null && d.electonflux !== '') ? parseInt(d.electonflux) : null,
       (d.aurora !== undefined && d.aurora !== null && d.aurora !== '') ? parseInt(d.aurora) : null,
       (d.normalization !== undefined && d.normalization !== null && d.normalization !== '') ? parseFloat(d.normalization) : null,
