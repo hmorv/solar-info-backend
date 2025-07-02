@@ -4,6 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node -r dotenv/config src/server.js dotenv_config_path=.env",
+    "dev": "nodemon -r dotenv/config src/server.js dotenv_config_path=.env.development",
+    "start:prod": "node -r dotenv/config src/server.js dotenv_config_path=.env.production",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Hugo Moragues <hugo.moragues@gmail.com>",
@@ -19,5 +22,8 @@
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0",
     "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   }
 }
