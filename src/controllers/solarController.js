@@ -13,8 +13,9 @@ function roundFields(obj, fields, decimals = 2) {
 
 exports.getLast = async (req, res) => {
   logger.info('➡️ Received GET request /api/solar/last');
+  let conn;
   try {
-    const conn = await getConnection();
+    conn = await getConnection();
     const [rows] = await conn.execute(
       `SELECT * FROM solar_readings ORDER BY timestamp DESC LIMIT 1`
     );
