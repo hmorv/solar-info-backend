@@ -24,6 +24,5 @@ router.get(
   solarController.getHistory
 );
 // Temporal: sin validación hasta instalar express-validator
-router.get('/history', solarController.getHistory);
 
 module.exports = router;
