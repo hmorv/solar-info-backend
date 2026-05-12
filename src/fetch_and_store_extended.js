@@ -26,66 +26,96 @@ async function parseAndStore() {
   const xml = await fetchXML();
   const parsed = await parseStringPromise(xml, { explicitArray: false });
 
-  const d = parsed.solar.solardata;
+  const d = parsed.solar?.solardata || parsed.solar;
+  if (!d) {
+    throw new Error('XML inválido: no se encontró solar/solardata');
+  }
+
+  function parseIntOrNull(value) {
+    return (value !== undefined && value !== null && value !== '' && /^-?\d+$/.test(value)) ? parseInt(value, 10) : null;
+  }
+
+  function parseFloatOrNull(value) {
+    return (value !== undefined && value !== null && value !== '' && /^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(value)) ? parseFloat(value) : null;
+  }
+
+  function trimOrNull(value) {
+    return typeof value === 'string' ? value.trim() || null : value || null;
+  }
 
   const conn = await mysql.createConnection(dbConfig);
-
-  const [result] = await conn.execute(`
-    INSERT INTO solar_readings (
-      updated, solar_flux, a_index, k_index, k_index_nt, x_ray, sunspots,
-      helium_line, proton_flux, electron_flux, aurora, normalization,
-      lat_degree, solar_wind, magnetic_field, geomag_field, signal_noise,
-      fof2, muffactor, muf
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      d.updated?.trim() || null,
-      (d.solarflux !== undefined && d.solarflux !== null && d.solarflux !== '') ? parseFloat(d.solarflux) : null,
-      (d.aindex !== undefined && d.aindex !== null && d.aindex !== '') ? parseInt(d.aindex) : null,
-      (d.kindex !== undefined && d.kindex !== null && d.kindex !== '') ? parseInt(d.kindex) : null,
-      d.kindexnt || null,
-      d.xray || null,
-      (d.sunspots !== undefined && d.sunspots !== null && d.sunspots !== '') ? parseInt(d.sunspots) : null,
-      (d.heliumline !== undefined && d.heliumline !== null && d.heliumline !== '') ? parseFloat(d.heliumline) : null,
-      (isFinite(d.protonflux) || /^\d+(\.\d+)?(e[+-]?\d+)?$/i.test(d.protonflux)) ? parseFloat(d.protonflux) : null,
-      (d.electonflux !== undefined && d.electonflux !== null && d.electonflux !== '') ? parseInt(d.electonflux) : null,
-      (d.aurora !== undefined && d.aurora !== null && d.aurora !== '') ? parseInt(d.aurora) : null,
-      (d.normalization !== undefined && d.normalization !== null && d.normalization !== '') ? parseFloat(d.normalization) : null,
-      (d.latdegree !== undefined && d.latdegree !== null && d.latdegree !== '') ? parseFloat(d.latdegree) : null,
-      (d.solarwind !== undefined && d.solarwind !== null && d.solarwind !== '') ? parseFloat(d.solarwind) : null,
-      (d.magneticfield !== undefined && d.magneticfield !== null && d.magneticfield !== '') ? parseFloat(d.magneticfield) : null,
-      d.geomagfield || null,
-      d.signalnoise || null,
-      d.fof2 || null,
-      d.muffactor || null,
-      d.muf || null
-    ]
-  );
-
-  const readingId = result.insertId;
-
-  // Band conditions
-  const bands = d.calculatedconditions?.band || [];
-  for (const band of Array.isArray(bands) ? bands : [bands]) {
-    await conn.execute(`
-      INSERT INTO band_conditions (reading_id, band_name, time_of_day, current_condition)
-      VALUES (?, ?, ?, ?)`,
-      [readingId, band.$.name, band.$.time, band._]
+  try {
+    const [result] = await conn.execute(`
+      INSERT INTO solar_readings (
+        updated, solar_flux, a_index, k_index, k_index_nt, x_ray, sunspots,
+        helium_line, proton_flux, electron_flux, aurora, normalization,
+        lat_degree, solar_wind, magnetic_field, geomag_field, signal_noise,
+        fof2, muffactor, muf
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        trimOrNull(d.updated),
+        parseFloatOrNull(d.solarflux),
+        parseIntOrNull(d.aindex),
+        parseIntOrNull(d.kindex),
+        trimOrNull(d.kindexnt),
+        trimOrNull(d.xray),
+        parseIntOrNull(d.sunspots),
+        parseFloatOrNull(d.heliumline),
+        parseFloatOrNull(d.protonflux),
+        parseIntOrNull(d.electonflux ?? d.electronflux),
+        parseIntOrNull(d.aurora),
+        parseFloatOrNull(d.normalization),
+        parseFloatOrNull(d.latdegree),
+        parseFloatOrNull(d.solarwind),
+        parseFloatOrNull(d.magneticfield),
+        trimOrNull(d.geomagfield),
+        trimOrNull(d.signalnoise),
+        trimOrNull(d.fof2),
+        trimOrNull(d.muffactor),
+        trimOrNull(d.muf)
+      ]
     );
-  }
 
-  // VHF conditions
-  const vhfs = d.calculatedvhfconditions?.phenomenon || [];
-  for (const pheno of Array.isArray(vhfs) ? vhfs : [vhfs]) {
-    await conn.execute(`
-      INSERT INTO vhf_conditions (reading_id, phenomenon_name, location, current_condition)
-      VALUES (?, ?, ?, ?)`,
-      [readingId, pheno.$.name, pheno.$.location, pheno._]
-    );
-  }
+    const readingId = result.insertId;
+    if (!readingId) {
+      throw new Error('No se obtuvo insertId al crear solar_readings');
+    }
 
-  await conn.end();
-  console.log(`✅ Lectura guardada (id ${readingId})`);
+    await conn.execute('COMMIT');
+
+    const calculatedBands = d.calculatedconditions ?? d.bandconditions;
+    const bands = calculatedBands?.band || [];
+    const bandArray = Array.isArray(bands) ? bands : bands ? [bands] : [];
+
+    for (const band of bandArray) {
+      await conn.execute(`
+        INSERT INTO band_conditions (reading_id, band_name, time_of_day, current_condition)
+        VALUES (?, ?, ?, ?)`,
+        [readingId, band.$?.name || null, band.$?.time || null, band._ || null]
+      );
+    }
+
+    const vhfSource = d.calculatedvhfconditions ?? d.vhfconditions;
+    const vhfs = vhfSource?.phenomenon || [];
+    const vhfArray = Array.isArray(vhfs) ? vhfs : vhfs ? [vhfs] : [];
+
+    for (const pheno of vhfArray) {
+      await conn.execute(`
+        INSERT INTO vhf_conditions (reading_id, phenomenon_name, location, current_condition)
+        VALUES (?, ?, ?, ?)`,
+        [readingId, pheno.$?.name || null, pheno.$?.location || null, pheno._ || null]
+      );
+    }
+
+    await conn.commit();
+    console.log(`✅ Lectura guardada (id ${readingId})`);
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    await conn.end();
+  }
 }
 
 parseAndStore().catch(err => console.error('❌ Error:', err.message));
