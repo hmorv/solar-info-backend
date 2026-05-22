@@ -6,20 +6,47 @@ const dbConfig = {
   host: 'localhost',
   user: 'dxsun',
   password: 'Los pajaros de plomo no vuelan tan bien como los de carne y hueso.',
-  database: 'dxsun'
+  database: 'dxsun',
 };
 
 const url = 'https://www.hamqsl.com/solarxml.php';
 
 async function fetchXML() {
   return new Promise((resolve, reject) => {
-    https.get(url, res => {
-      let data = '';
-      res.on('data', chunk => (data += chunk));
-      res.on('end', () => resolve(data));
-      res.on('error', reject);
-    });
+    https
+      .get(url, (res) => {
+        let data = '';
+
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => resolve(data));
+      })
+      .on('error', reject);
   });
+}
+
+function parseIntOrNull(value) {
+  return value !== undefined &&
+    value !== null &&
+    value !== '' &&
+    /^\s*-?\d+\s*$/.test(String(value))
+    ? parseInt(value, 10)
+    : null;
+}
+
+function parseFloatOrNull(value) {
+  return value !== undefined &&
+    value !== null &&
+    value !== '' &&
+    /^\s*-?\d+(\.\d+)?(e[+-]?\d+)?\s*$/i.test(String(value))
+    ? parseFloat(value)
+    : null;
+}
+
+function trimOrNull(value) {
+  return typeof value === 'string' ? value.trim() || null : value ?? null;
 }
 
 async function parseAndStore() {
@@ -27,32 +54,36 @@ async function parseAndStore() {
   const parsed = await parseStringPromise(xml, { explicitArray: false });
 
   const d = parsed.solar?.solardata || parsed.solar;
+
   if (!d) {
     throw new Error('XML inválido: no se encontró solar/solardata');
   }
 
-  function parseIntOrNull(value) {
-    return (value !== undefined && value !== null && value !== '' && /^-?\d+$/.test(value)) ? parseInt(value, 10) : null;
-  }
-
-  function parseFloatOrNull(value) {
-    return (value !== undefined && value !== null && value !== '' && /^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(value)) ? parseFloat(value) : null;
-  }
-
-  function trimOrNull(value) {
-    return typeof value === 'string' ? value.trim() || null : value || null;
-  }
-
   const conn = await mysql.createConnection(dbConfig);
+
   try {
-    const [result] = await conn.execute(`
+    const [dbInfo] = await conn.query(`
+      SELECT 
+        DATABASE() AS db,
+        USER() AS user,
+        @@hostname AS host,
+        @@port AS port
+    `);
+
+    console.log('📌 DB info:', dbInfo[0]);
+
+    await conn.beginTransaction();
+
+    const [result] = await conn.execute(
+      `
       INSERT INTO solar_readings (
         updated, solar_flux, a_index, k_index, k_index_nt, x_ray, sunspots,
         helium_line, proton_flux, electron_flux, aurora, normalization,
         lat_degree, solar_wind, magnetic_field, geomag_field, signal_noise,
         fof2, muffactor, muf
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
       [
         trimOrNull(d.updated),
         parseFloatOrNull(d.solarflux),
@@ -73,25 +104,30 @@ async function parseAndStore() {
         trimOrNull(d.signalnoise),
         trimOrNull(d.fof2),
         trimOrNull(d.muffactor),
-        trimOrNull(d.muf)
+        trimOrNull(d.muf),
       ]
     );
 
     const readingId = result.insertId;
+
     if (!readingId) {
       throw new Error('No se obtuvo insertId al crear solar_readings');
     }
 
-    await conn.execute('COMMIT');
+    console.log(`📌 solar_readings insertId: ${readingId}`);
 
     const calculatedBands = d.calculatedconditions ?? d.bandconditions;
     const bands = calculatedBands?.band || [];
     const bandArray = Array.isArray(bands) ? bands : bands ? [bands] : [];
 
     for (const band of bandArray) {
-      await conn.execute(`
-        INSERT INTO band_conditions (reading_id, band_name, time_of_day, current_condition)
-        VALUES (?, ?, ?, ?)`,
+      await conn.execute(
+        `
+        INSERT INTO band_conditions (
+          reading_id, band_name, time_of_day, current_condition
+        )
+        VALUES (?, ?, ?, ?)
+        `,
         [readingId, band.$?.name || null, band.$?.time || null, band._ || null]
       );
     }
@@ -101,21 +137,41 @@ async function parseAndStore() {
     const vhfArray = Array.isArray(vhfs) ? vhfs : vhfs ? [vhfs] : [];
 
     for (const pheno of vhfArray) {
-      await conn.execute(`
-        INSERT INTO vhf_conditions (reading_id, phenomenon_name, location, current_condition)
-        VALUES (?, ?, ?, ?)`,
+      await conn.execute(
+        `
+        INSERT INTO vhf_conditions (
+          reading_id, phenomenon_name, location, current_condition
+        )
+        VALUES (?, ?, ?, ?)
+        `,
         [readingId, pheno.$?.name || null, pheno.$?.location || null, pheno._ || null]
       );
     }
 
+    const [checkRows] = await conn.execute(
+      `
+      SELECT id, updated, fof2, muffactor, muf
+      FROM solar_readings
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [readingId]
+    );
+
+    console.log('📌 Insert check:', checkRows[0] || null);
+
     await conn.commit();
-    console.log(`✅ Lectura guardada (id ${readingId})`);
+
+    console.log(`✅ Lectura guardada correctamente en dxsun.solar_readings (id ${readingId})`);
   } catch (error) {
     await conn.rollback();
+    console.error('❌ Rollback ejecutado:', error.message);
     throw error;
   } finally {
     await conn.end();
   }
 }
 
-parseAndStore().catch(err => console.error('❌ Error:', err.message));
+parseAndStore().catch((err) => {
+  console.error('❌ Error:', err.message);
+});

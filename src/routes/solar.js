@@ -25,4 +25,18 @@ router.get(
 );
 // Temporal: sin validación hasta instalar express-validator
 
+router.get(
+  '/now-context',
+  [
+    query('window').optional().isIn(['1h', '3h', '6h', '12h', '24h']),
+  ],
+  (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    next();
+  },
+  solarController.getNowContext
+);
+
+
 module.exports = router;

@@ -39,6 +39,10 @@ app.use(
 const solarRoutes = require('./routes/solar');
 app.use('/api/solar', solarRoutes);
 
+// Importar y usar las rutas de la API ionosférica
+const ionosphereRoutes = require('./routes/ionosphere');
+app.use('/api/ionosphere', ionosphereRoutes);
+
 app.listen(PORT, HOST, () => {
   logger.info(`🌞 Servidor solar en http://${HOST}:${PORT}`);
 });
