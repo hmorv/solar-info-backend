@@ -5,13 +5,26 @@ const { query, validationResult } = require('express-validator');
 
 const ionosphereController = require('../controllers/ionosphereController');
 
+router.get('/stations', ionosphereController.getStations);
+
 // GET /api/ionosphere/hf
-// Parámetros: lat (latitud), lon (longitud)
 router.get(
   '/hf',
   [
-    query('lat').isFloat({ min: -90, max: 90 }).notEmpty().withMessage('lat must be between -90 and 90'),
-    query('lon').isFloat({ min: -180, max: 360 }).notEmpty().withMessage('lon must be between -180 and 360'),
+    query('station')
+      .optional()
+      .isString()
+      .trim()
+      .notEmpty()
+      .withMessage('station must be a valid station id'),
+    query('lat')
+      .optional()
+      .isFloat({ min: -90, max: 90 })
+      .withMessage('lat must be between -90 and 90'),
+    query('lon')
+      .optional()
+      .isFloat({ min: -180, max: 360 })
+      .withMessage('lon must be between -180 and 360'),
   ],
   (req, res, next) => {
     const errors = validationResult(req);

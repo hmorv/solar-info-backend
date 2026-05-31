@@ -3,8 +3,43 @@ const axios = require('axios');
 const logger = require('../config/logger');
 const stations = require('../config/stations');
 
-const GIRO_BASE_URL = 'https://lgdc.uml.edu/common/DIDBGetValues';
-const DISTANCE_THRESHOLD_KM = 500; // Aproximación: 1 grado ≈ 111 km
+const GIRO_BASE_URL = 'https://lgdc.uml.edu/fastchar/getbest';
+
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
+const giroCache = new Map();
+
+function getCacheKey(station) {
+  return station.ursi.toUpperCase();
+}
+
+function getCachedData(station) {
+  const key = getCacheKey(station);
+  const entry = giroCache.get(key);
+
+  if (!entry) return null;
+
+  const ageMs = Date.now() - entry.cachedAt;
+
+  if (ageMs > CACHE_TTL_MS) {
+    giroCache.delete(key);
+    return null;
+  }
+
+  return {
+    ...entry.data,
+    cached: true,
+    cacheAgeSeconds: Math.floor(ageMs / 1000),
+  };
+}
+
+function saveCachedData(station, data) {
+  const key = getCacheKey(station);
+
+  giroCache.set(key, {
+    data,
+    cachedAt: Date.now(),
+  });
+}
 
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -38,9 +73,10 @@ function findNearestStation(lat, lon) {
   return nearest;
 }
 
-function normalizeLongitude(lon) {
-  if (lon > 180) return lon - 360;
-  return lon;
+function findStationById(id) {
+  if (!id) return null;
+  const normalizedId = String(id).trim().toUpperCase();
+  return stations.find((station) => station.ursi.toUpperCase() === normalizedId) ?? null;
 }
 
 function formatGiroDate(date) {
@@ -74,13 +110,7 @@ function parseGiroResponse(data) {
     throw new Error('No data found in GIRO response');
   }
 
-  // Formato real esperado:
-  // Time CS foF2 QD MUFD QD foEs QD hF2 QD MD QD
   const parts = lastDataLine.split(/\s+/);
-
-  if (parts.length < 12) {
-    throw new Error(`Invalid data format in GIRO response: ${lastDataLine}`);
-  }
 
   const timestamp = parts[0];
   const cs = parseInt(parts[1], 10);
@@ -88,10 +118,10 @@ function parseGiroResponse(data) {
   const tokens = parts.slice(2);
 
   const foF2 = parseGiroNumber(tokens[0]);
-  const mufd = parseGiroNumber(tokens[2]);
-  const foEs = parseGiroNumber(tokens[4]);
-  const hF2 = parseGiroNumber(tokens[6]);
-  const md = parseGiroNumber(tokens[8]);
+  const foEs = parseGiroNumber(tokens[2]);
+  const mufd = parseGiroNumber(tokens[4]);
+  const md = parseGiroNumber(tokens[6]);
+  const hF2 = parseGiroNumber(tokens[8]);
 
   const measurementDate = new Date(timestamp);
 
@@ -113,7 +143,7 @@ function parseGiroResponse(data) {
     mufFactor: md,
     hF2,
     foEs,
-    confidence: cs,
+    confidence: Number.isFinite(cs) ? cs : null,
     ageMinutes,
     freshness,
   };
@@ -123,32 +153,62 @@ exports.getHFData = async (req, res) => {
   logger.info('➡️ Received GET request /api/ionosphere/hf');
 
   try {
-    const { lat, lon } = req.query;
+    const { lat, lon, station } = req.query;
+    const stationId = Array.isArray(station) ? station[0] : station;
 
-    if (lat === undefined || lon === undefined) {
-      logger.warn('Missing lat or lon parameters');
-      return res.status(400).json({ error: 'lat and lon parameters are required' });
+    let selectedStation = null;
+
+    if (stationId) {
+      selectedStation = findStationById(stationId);
+
+      if (!selectedStation) {
+        logger.warn('Unknown station requested', { stationId });
+        return res.status(400).json({ error: `Unknown station id: ${stationId}` });
+      }
     }
 
-    const userLat = parseFloat(lat);
-    const userLon = parseFloat(lon);
+    let nearestStation = null;
 
-    if (Number.isNaN(userLat) || Number.isNaN(userLon)) {
-      logger.warn('Invalid lat or lon values');
-      return res.status(400).json({ error: 'lat and lon must be valid numbers' });
+    if (selectedStation) {
+      nearestStation = { ...selectedStation, distance: null };
+      logger.info('Using selected station from request', { station: selectedStation.name });
+    } else {
+      if (lat === undefined || lon === undefined) {
+        logger.warn('Missing lat or lon parameters');
+        return res.status(400).json({ error: 'station or lat and lon parameters are required' });
+      }
+
+      const userLat = parseFloat(Array.isArray(lat) ? lat[0] : lat);
+      const userLon = parseFloat(Array.isArray(lon) ? lon[0] : lon);
+
+      if (Number.isNaN(userLat) || Number.isNaN(userLon)) {
+        logger.warn('Invalid lat or lon values');
+        return res.status(400).json({ error: 'lat and lon must be valid numbers' });
+      }
+
+      nearestStation = findNearestStation(userLat, userLon);
+
+      if (!nearestStation) {
+        logger.warn('No GIRO station found');
+        return res.status(500).json({ error: 'No GIRO station available' });
+      }
+
+      logger.info('Nearest station found', {
+        station: nearestStation.name,
+        distance: nearestStation.distance.toFixed(2),
+      });
     }
 
-    const nearestStation = findNearestStation(userLat, userLon);
+    const cachedResponse = getCachedData(nearestStation);
 
-    if (!nearestStation) {
-      logger.warn('No GIRO station found');
-      return res.status(500).json({ error: 'No GIRO station available' });
+    if (cachedResponse) {
+      logger.info('Serving GIRO data from cache', {
+        station: nearestStation.name,
+        cacheAgeSeconds: cachedResponse.cacheAgeSeconds,
+      });
+
+      return res.json(cachedResponse);
     }
-
-    logger.info('Nearest station found', {
-      station: nearestStation.name,
-      distance: nearestStation.distance.toFixed(2),
-    });
 
     const now = new Date();
     const toDate = new Date(now);
@@ -157,20 +217,22 @@ exports.getHFData = async (req, res) => {
     const fromDateStr = formatGiroDate(fromDate);
     const toDateStr = formatGiroDate(toDate);
 
-    logger.info('GIRO request parameters', {
+    const params = {
       ursiCode: nearestStation.ursi,
+      charName: 'foF2,foEs,MUFD,MD,hF2',
+      DMUF: 3000,
       fromDate: fromDateStr,
       toDate: toDateStr,
+    };
+
+    const queryString = new URLSearchParams(params).toString();
+
+    logger.info('GIRO request URL', {
+      url: `${GIRO_BASE_URL}?${queryString}`,
     });
 
     const giroResponse = await axios.get(GIRO_BASE_URL, {
-      params: {
-        ursiCode: nearestStation.ursi,
-        charName: 'foF2,MUFD,MD,hF2,foEs',
-        DMUF: 3000,
-        fromDate: fromDateStr,
-        toDate: toDateStr,
-      },
+      params,
       timeout: 10000,
     });
 
@@ -182,10 +244,11 @@ exports.getHFData = async (req, res) => {
     const parsedData = parseGiroResponse(giroResponse.data);
 
     const response = {
+      cached: false,
       station: {
         ursiCode: nearestStation.ursi,
         name: nearestStation.name,
-        distanceKm: Number(nearestStation.distance.toFixed(2)),
+        distanceKm: nearestStation.distance != null ? Number(nearestStation.distance.toFixed(2)) : null,
       },
       measuredAt: parsedData.timestamp,
       foF2: parsedData.foF2,
@@ -198,11 +261,14 @@ exports.getHFData = async (req, res) => {
       freshness: parsedData.freshness,
     };
 
+    saveCachedData(nearestStation, response);
+
     logger.info('Response sent for /api/ionosphere/hf', {
       station: nearestStation.name,
       foF2: parsedData.foF2,
       muf: parsedData.mufd,
       mufFactor: parsedData.mufFactor,
+      cached: false,
     });
 
     return res.json(response);
@@ -210,6 +276,9 @@ exports.getHFData = async (req, res) => {
     if (error.response) {
       logger.error('GIRO API error', {
         status: error.response.status,
+        statusText: error.response.statusText,
+        requestUrl: error.config?.url,
+        requestParams: error.config?.params,
         data: error.response.data,
       });
 
@@ -219,4 +288,9 @@ exports.getHFData = async (req, res) => {
     logger.error('Error in /api/ionosphere/hf', { error: error.message });
     return res.status(500).json({ error: error.message || 'Server error' });
   }
+};
+
+exports.getStations = (req, res) => {
+  const stationList = stations.map(({ ursi, name }) => ({ ursi, name }));
+  return res.json(stationList);
 };
