@@ -5,7 +5,7 @@ const stations = require('../config/stations');
 
 const GIRO_BASE_URL = 'https://lgdc.uml.edu/fastchar/getbest';
 
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
+const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutos
 const giroCache = new Map();
 
 function getCacheKey(station) {
@@ -219,7 +219,7 @@ exports.getHFData = async (req, res) => {
 
     const params = {
       ursiCode: nearestStation.ursi,
-      charName: 'foF2,foEs,MUFD,MD,hF2',
+      charName: 'foF2,foEs,MUF(D),M(D),h`F2',
       DMUF: 3000,
       fromDate: fromDateStr,
       toDate: toDateStr,
