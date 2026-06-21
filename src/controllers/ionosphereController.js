@@ -25,10 +25,49 @@ function getCachedData(station) {
     return null;
   }
 
+  // Calcular la antigüedad actual: antigüedad que se guardó + tiempo transcurrido desde el cacheo
+  const nowMs = Date.now();
+  const elapsedMs = nowMs - entry.cachedAt;
+  const elapsedMinutes = Math.floor(elapsedMs / (1000 * 60));
+
+  // Determinar la antigüedad almacenada cuando se guardó (fallback a 0 si no está disponible)
+  let storedAge = null;
+  if (entry.data && typeof entry.data.ageMinutes === 'number') {
+    storedAge = entry.data.ageMinutes;
+  } else if (entry.data && entry.data.measuredAt) {
+    const measuredAtMs = new Date(entry.data.measuredAt).getTime();
+    if (!Number.isNaN(measuredAtMs)) {
+      storedAge = Math.floor((entry.cachedAt - measuredAtMs) / (1000 * 60));
+    }
+  }
+  if (storedAge === null) storedAge = 0;
+
+  const updatedAgeMinutes = storedAge + elapsedMinutes;
+
+  // Recalcular freshness con la antigüedad actualizada
+  const freshness = computeFreshness(updatedAgeMinutes);
+
+  logger.debug('getCachedData calculation', {
+    storedAge,
+    elapsedMinutes,
+    updatedAgeMinutes,
+    freshness,
+    elapsedMs,
+    measuredAt: entry.data.measuredAt,
+  });
+
+  // Actualizar la entrada en caché para que el frontal reciba ageMinutes actualizado
+  entry.data.ageMinutes = updatedAgeMinutes;
+  entry.data.freshness = freshness;
+
+  // Actualizamos cachedAt para que no se vuelva a sumar el mismo intervalo en siguientes lecturas
+  entry.cachedAt = nowMs;
+
   return {
     ...entry.data,
     cached: true,
-    cacheAgeSeconds: Math.floor(ageMs / 1000),
+    // cacheAgeSeconds refleja cuánto tiempo había pasado desde el cacheo original hasta ahora
+    cacheAgeSeconds: Math.floor(elapsedMs / 1000),
   };
 }
 
@@ -87,21 +126,34 @@ function formatGiroDate(date) {
   ).padStart(2, '0')}:${String(date.getUTCSeconds()).padStart(2, '0')}`;
 }
 
+function computeFreshness(ageMinutes) {
+  let freshness = 'old';
+  if (ageMinutes < 60) freshness = 'fresh';
+  else if (ageMinutes < 180) freshness = 'ok';
+  return freshness;
+}
+
 function parseGiroNumber(value) {
   const n = parseFloat(value);
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
 
 function parseGiroResponse(data) {
-  const lines = data.split('\n');
+  // split on any common newline sequence and search for the last line
+  const lines = data.split(/\r?\n/);
 
   let lastDataLine = null;
 
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
+    const raw = lines[i];
+    if (!raw) continue;
+    const line = raw.trim();
 
-    if (line && /^\d{4}-\d{2}-\d{2}T/.test(line)) {
-      lastDataLine = line;
+    // Be tolerante: puede haber prefijos o espacios, buscamos la primera ocurrencia de timestamp
+    const match = line.match(/\d{4}-\d{2}-\d{2}T/);
+    if (match) {
+      // Extraemos desde la posición donde aparece el timestamp
+      lastDataLine = line.slice(match.index);
       break;
     }
   }
@@ -132,9 +184,14 @@ function parseGiroResponse(data) {
   const now = new Date();
   const ageMinutes = Math.floor((now - measurementDate) / (1000 * 60));
 
-  let freshness = 'old';
-  if (ageMinutes < 60) freshness = 'fresh';
-  else if (ageMinutes < 180) freshness = 'ok';
+  const freshness = computeFreshness(ageMinutes);
+
+  logger.debug('parseGiroResponse calculated ageMinutes', {
+    timestamp,
+    measurementDate: measurementDate.toISOString(),
+    ageMinutes,
+    freshness,
+  });
 
   return {
     timestamp: measurementDate.toISOString(),
@@ -171,6 +228,21 @@ exports.getHFData = async (req, res) => {
 
     if (selectedStation) {
       nearestStation = { ...selectedStation, distance: null };
+
+      // Si nos pasan coordenadas junto con el id de estación, calcular la distancia
+      if (lat !== undefined && lon !== undefined) {
+        const userLat = parseFloat(Array.isArray(lat) ? lat[0] : lat);
+        const userLon = parseFloat(Array.isArray(lon) ? lon[0] : lon);
+
+        if (!Number.isNaN(userLat) && !Number.isNaN(userLon)) {
+          nearestStation.distance = calculateDistance(userLat, userLon, selectedStation.lat, selectedStation.lon);
+          logger.info('Computed distance for selected station from provided coords', {
+            station: selectedStation.name,
+            distance: nearestStation.distance.toFixed(2),
+          });
+        }
+      }
+
       logger.info('Using selected station from request', { station: selectedStation.name });
     } else {
       if (lat === undefined || lon === undefined) {
@@ -205,14 +277,29 @@ exports.getHFData = async (req, res) => {
       logger.info('Serving GIRO data from cache', {
         station: nearestStation.name,
         cacheAgeSeconds: cachedResponse.cacheAgeSeconds,
+        ageMinutes: cachedResponse.ageMinutes,
+        freshness: cachedResponse.freshness,
+        measuredAt: cachedResponse.measuredAt,
       });
 
-      return res.json(cachedResponse);
+      // No mutamos la caché aquí; construimos una copia y sobrescribimos distanceKm
+      const responseToSend = {
+        ...cachedResponse,
+        station: {
+          ...cachedResponse.station,
+          distanceKm:
+            nearestStation && nearestStation.distance != null
+              ? Number(nearestStation.distance.toFixed(2))
+              : cachedResponse.station.distanceKm,
+        },
+      };
+
+      return res.json(responseToSend);
     }
 
     const now = new Date();
     const toDate = new Date(now);
-    const fromDate = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    const fromDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);  // Extender búsqueda a 24 horas para obtener datos más recientes
 
     const fromDateStr = formatGiroDate(fromDate);
     const toDateStr = formatGiroDate(toDate);
@@ -241,7 +328,15 @@ exports.getHFData = async (req, res) => {
       dataLength: giroResponse.data.length,
     });
 
-    const parsedData = parseGiroResponse(giroResponse.data);
+    let parsedData;
+    try {
+      parsedData = parseGiroResponse(giroResponse.data);
+    } catch (err) {
+      // Log a snippet of the GIRO response to help debugging when parsing fails
+      const snippet = typeof giroResponse.data === 'string' ? giroResponse.data.slice(0, 2000) : String(giroResponse.data);
+      logger.error('Failed to parse GIRO response', { error: err.message, snippet });
+      throw err;
+    }
 
     const response = {
       cached: false,
