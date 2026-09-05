@@ -3,12 +3,15 @@ require('dotenv').config();
 const express = require('express');
 const morgan = require('morgan');
 const helmet = require('helmet');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const logger = require('./config/logger');
 
 const solarRoutes = require('./routes/solar');
 const ionosphereRoutes = require('./routes/ionosphere');
+const pushRoutes = require('./routes/push');
+const alarmsRoutes = require('./routes/alarms');
 
 const app = express();
 
@@ -26,6 +29,11 @@ const limiter = rateLimit({
 });
 
 app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// Needed for JSON request bodies such as POST /api/push/devices
+app.use(express.json());
 
 app.use(
   morgan(
@@ -46,6 +54,8 @@ app.use('/api', limiter);
 
 app.use('/api/solar', solarRoutes);
 app.use('/api/ionosphere', ionosphereRoutes);
+app.use('/api/push', pushRoutes);
+app.use('/api/alarms', alarmsRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -55,6 +65,7 @@ app.use((err, req, res, next) => {
   logger.error(err.stack || err.message || err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
 
 app.listen(PORT, HOST, () => {
   logger.info(`🌞 Servidor solar en http://${HOST}:${PORT}`);

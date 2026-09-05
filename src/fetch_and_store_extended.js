@@ -1,3 +1,4 @@
+const { evaluateSolarAlarms } = require('./services/alarmEvaluator');
 const https = require('https');
 const mysql = require('mysql2/promise');
 const { parseStringPromise } = require('xml2js');
@@ -5,7 +6,8 @@ const { parseStringPromise } = require('xml2js');
 const dbConfig = {
   host: 'localhost',
   user: 'dxsun',
-  password: 'Los pajaros de plomo no vuelan tan bien como los de carne y hueso.',
+  password:
+    'Los pajaros de plomo no vuelan tan bien como los de carne y hueso.',
   database: 'dxsun',
 };
 
@@ -63,7 +65,7 @@ async function parseAndStore() {
 
   try {
     const [dbInfo] = await conn.query(`
-      SELECT 
+      SELECT
         DATABASE() AS db,
         USER() AS user,
         @@hostname AS host,
@@ -74,32 +76,65 @@ async function parseAndStore() {
 
     await conn.beginTransaction();
 
+    const reading = {
+      solarFlux: parseFloatOrNull(d.solarflux),
+      aIndex: parseIntOrNull(d.aindex),
+      kIndex: parseIntOrNull(d.kindex),
+      kIndexNt: trimOrNull(d.kindexnt),
+      xRay: trimOrNull(d.xray),
+      sunspots: parseIntOrNull(d.sunspots),
+      heliumLine: parseFloatOrNull(d.heliumline),
+      protonFlux: parseFloatOrNull(d.protonflux),
+      electronFlux: parseIntOrNull(d.electonflux ?? d.electronflux),
+      aurora: parseIntOrNull(d.aurora),
+      normalization: parseFloatOrNull(d.normalization),
+      latDegree: parseFloatOrNull(d.latdegree),
+      solarWind: parseFloatOrNull(d.solarwind),
+      magneticField: parseFloatOrNull(d.magneticfield),
+    };
+
     const [result] = await conn.execute(
       `
       INSERT INTO solar_readings (
-        updated, solar_flux, a_index, k_index, k_index_nt, x_ray, sunspots,
-        helium_line, proton_flux, electron_flux, aurora, normalization,
-        lat_degree, solar_wind, magnetic_field, geomag_field, signal_noise,
-        fof2, muffactor, muf
+        updated,
+        solar_flux,
+        a_index,
+        k_index,
+        k_index_nt,
+        x_ray,
+        sunspots,
+        helium_line,
+        proton_flux,
+        electron_flux,
+        aurora,
+        normalization,
+        lat_degree,
+        solar_wind,
+        magnetic_field,
+        geomag_field,
+        signal_noise,
+        fof2,
+        muffactor,
+        muf
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         trimOrNull(d.updated),
-        parseFloatOrNull(d.solarflux),
-        parseIntOrNull(d.aindex),
-        parseIntOrNull(d.kindex),
-        trimOrNull(d.kindexnt),
-        trimOrNull(d.xray),
-        parseIntOrNull(d.sunspots),
-        parseFloatOrNull(d.heliumline),
-        parseFloatOrNull(d.protonflux),
-        parseIntOrNull(d.electonflux ?? d.electronflux),
-        parseIntOrNull(d.aurora),
-        parseFloatOrNull(d.normalization),
-        parseFloatOrNull(d.latdegree),
-        parseFloatOrNull(d.solarwind),
-        parseFloatOrNull(d.magneticfield),
+        reading.solarFlux,
+        reading.aIndex,
+        reading.kIndex,
+        reading.kIndexNt,
+        reading.xRay,
+        reading.sunspots,
+        reading.heliumLine,
+        reading.protonFlux,
+        reading.electronFlux,
+        reading.aurora,
+        reading.normalization,
+        reading.latDegree,
+        reading.solarWind,
+        reading.magneticField,
         trimOrNull(d.geomagfield),
         trimOrNull(d.signalnoise),
         trimOrNull(d.fof2),
@@ -124,11 +159,19 @@ async function parseAndStore() {
       await conn.execute(
         `
         INSERT INTO band_conditions (
-          reading_id, band_name, time_of_day, current_condition
+          reading_id,
+          band_name,
+          time_of_day,
+          current_condition
         )
         VALUES (?, ?, ?, ?)
         `,
-        [readingId, band.$?.name || null, band.$?.time || null, band._ || null]
+        [
+          readingId,
+          band.$?.name || null,
+          band.$?.time || null,
+          band._ || null,
+        ]
       );
     }
 
@@ -140,17 +183,30 @@ async function parseAndStore() {
       await conn.execute(
         `
         INSERT INTO vhf_conditions (
-          reading_id, phenomenon_name, location, current_condition
+          reading_id,
+          phenomenon_name,
+          location,
+          current_condition
         )
         VALUES (?, ?, ?, ?)
         `,
-        [readingId, pheno.$?.name || null, pheno.$?.location || null, pheno._ || null]
+        [
+          readingId,
+          pheno.$?.name || null,
+          pheno.$?.location || null,
+          pheno._ || null,
+        ]
       );
     }
 
     const [checkRows] = await conn.execute(
       `
-      SELECT id, updated, fof2, muffactor, muf
+      SELECT
+        id,
+        updated,
+        fof2,
+        muffactor,
+        muf
       FROM solar_readings
       WHERE id = ?
       LIMIT 1
@@ -162,7 +218,11 @@ async function parseAndStore() {
 
     await conn.commit();
 
-    console.log(`✅ Lectura guardada correctamente en dxsun.solar_readings (id ${readingId})`);
+    console.log(
+      `✅ Lectura guardada correctamente en dxsun.solar_readings (id ${readingId})`
+    );
+
+    await evaluateSolarAlarms(reading);
   } catch (error) {
     await conn.rollback();
     console.error('❌ Rollback ejecutado:', error.message);

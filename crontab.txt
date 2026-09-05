@@ -1,0 +1,1 @@
+*/5 * * * * cd /home/hugo/dxsun && /home/hugo/.nvm/versions/node/v20.5.1/bin/node -r dotenv/config src/fetch_and_store_extended.js dotenv_config_path=.env >> /home/hugo/dxsun/cron.log 2>&1
