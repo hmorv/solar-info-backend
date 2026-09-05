@@ -18,56 +18,58 @@ function getCachedData(station) {
 
   if (!entry) return null;
 
-  const ageMs = Date.now() - entry.cachedAt;
+  const nowMs = Date.now();
+  const cacheAgeMs = nowMs - entry.cachedAt;
 
-  if (ageMs > CACHE_TTL_MS) {
+  /*
+   * cachedAt representa exclusivamente el momento en que se obtuvo
+   * la información desde GIRO.
+   *
+   * No debe actualizarse al leer la caché, porque hacerlo reiniciaría
+   * constantemente el TTL y una estación consultada con frecuencia
+   * podría permanecer en caché indefinidamente.
+   */
+  if (cacheAgeMs > CACHE_TTL_MS) {
     giroCache.delete(key);
     return null;
   }
 
-  // Calcular la antigüedad actual: antigüedad que se guardó + tiempo transcurrido desde el cacheo
-  const nowMs = Date.now();
-  const elapsedMs = nowMs - entry.cachedAt;
-  const elapsedMinutes = Math.floor(elapsedMs / (1000 * 60));
+  /*
+   * La antigüedad de la medición se calcula directamente desde
+   * measuredAt, independientemente de la antigüedad de la caché.
+   */
+  const measuredAtMs = entry.data?.measuredAt
+    ? new Date(entry.data.measuredAt).getTime()
+    : NaN;
 
-  // Determinar la antigüedad almacenada cuando se guardó (fallback a 0 si no está disponible)
-  let storedAge = null;
-  if (entry.data && typeof entry.data.ageMinutes === 'number') {
-    storedAge = entry.data.ageMinutes;
-  } else if (entry.data && entry.data.measuredAt) {
-    const measuredAtMs = new Date(entry.data.measuredAt).getTime();
-    if (!Number.isNaN(measuredAtMs)) {
-      storedAge = Math.floor((entry.cachedAt - measuredAtMs) / (1000 * 60));
-    }
+  let ageMinutes = entry.data?.ageMinutes ?? 0;
+
+  if (!Number.isNaN(measuredAtMs)) {
+    ageMinutes = Math.max(
+      0,
+      Math.floor((nowMs - measuredAtMs) / (1000 * 60))
+    );
   }
-  if (storedAge === null) storedAge = 0;
 
-  const updatedAgeMinutes = storedAge + elapsedMinutes;
-
-  // Recalcular freshness con la antigüedad actualizada
-  const freshness = computeFreshness(updatedAgeMinutes);
+  const freshness = computeFreshness(ageMinutes);
 
   logger.debug('getCachedData calculation', {
-    storedAge,
-    elapsedMinutes,
-    updatedAgeMinutes,
+    cacheAgeSeconds: Math.floor(cacheAgeMs / 1000),
+    ageMinutes,
     freshness,
-    elapsedMs,
-    measuredAt: entry.data.measuredAt,
+    measuredAt: entry.data?.measuredAt,
   });
 
-  // Actualizar la entrada en caché para que el frontal reciba ageMinutes actualizado
-  entry.data.ageMinutes = updatedAgeMinutes;
-  entry.data.freshness = freshness;
-
-  // Actualizamos cachedAt para que no se vuelva a sumar el mismo intervalo en siguientes lecturas
-  entry.cachedAt = nowMs;
-
+  /*
+   * No modificamos entry.data.
+   * Devolvemos una copia con los valores dinámicos actualizados.
+   */
   return {
     ...entry.data,
+    ageMinutes,
+    freshness,
     cached: true,
-    // cacheAgeSeconds refleja cuánto tiempo había pasado desde el cacheo original hasta ahora
-    cacheAgeSeconds: Math.floor(elapsedMs / 1000),
+    cacheAgeSeconds: Math.floor(cacheAgeMs / 1000),
   };
 }
 
@@ -75,7 +77,9 @@ function saveCachedData(station, data) {
   const key = getCacheKey(station);
 
   giroCache.set(key, {
-    data,
+    data: {
+      ...data,
+    },
     cachedAt: Date.now(),
   });
 }
@@ -93,7 +97,19 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
       Math.sin(dLon / 2);
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
   return R * c;
+}
+
+function isValidCoordinates(lat, lon) {
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180
+  );
 }
 
 function findNearestStation(lat, lon) {
@@ -101,11 +117,20 @@ function findNearestStation(lat, lon) {
   let minDistance = Infinity;
 
   stations.forEach((station) => {
-    const distance = calculateDistance(lat, lon, station.lat, station.lon);
+    const distance = calculateDistance(
+      lat,
+      lon,
+      station.lat,
+      station.lon
+    );
 
     if (distance < minDistance) {
       minDistance = distance;
-      nearest = { ...station, distance: minDistance };
+
+      nearest = {
+        ...station,
+        distance: minDistance,
+      };
     }
   });
 
@@ -114,278 +139,760 @@ function findNearestStation(lat, lon) {
 
 function findStationById(id) {
   if (!id) return null;
-  const normalizedId = String(id).trim().toUpperCase();
-  return stations.find((station) => station.ursi.toUpperCase() === normalizedId) ?? null;
+
+  const normalizedId = String(id)
+    .trim()
+    .toUpperCase();
+
+  return (
+    stations.find(
+      (station) =>
+        station.ursi.toUpperCase() === normalizedId
+    ) ?? null
+  );
 }
 
 function formatGiroDate(date) {
-  return `${date.getUTCFullYear()}/${String(date.getUTCMonth() + 1).padStart(2, '0')}/${String(
+  return `${date.getUTCFullYear()}/${String(
+    date.getUTCMonth() + 1
+  ).padStart(2, '0')}/${String(
     date.getUTCDate()
-  ).padStart(2, '0')} ${String(date.getUTCHours()).padStart(2, '0')}:${String(
+  ).padStart(2, '0')} ${String(
+    date.getUTCHours()
+  ).padStart(2, '0')}:${String(
     date.getUTCMinutes()
-  ).padStart(2, '0')}:${String(date.getUTCSeconds()).padStart(2, '0')}`;
+  ).padStart(2, '0')}:${String(
+    date.getUTCSeconds()
+  ).padStart(2, '0')}`;
 }
 
 function computeFreshness(ageMinutes) {
-  let freshness = 'old';
-  if (ageMinutes < 60) freshness = 'fresh';
-  else if (ageMinutes < 180) freshness = 'ok';
-  return freshness;
+  if (ageMinutes < 60) {
+    return 'fresh';
+  }
+
+  if (ageMinutes < 180) {
+    return 'ok';
+  }
+
+  return 'old';
 }
 
 function parseGiroNumber(value) {
   const n = parseFloat(value);
-  return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+
+  return Number.isFinite(n)
+    ? Number(n.toFixed(2))
+    : null;
+}
+
+function isValidFoF2(value) {
+  return (
+    value !== null &&
+    value > 0 &&
+    value <= 30
+  );
+}
+
+function sanitizeFoEs(value) {
+  if (
+    value === null ||
+    value <= 0 ||
+    value > 30
+  ) {
+    return null;
+  }
+
+  return value;
+}
+
+function sanitizeMuf(value) {
+  if (
+    value === null ||
+    value <= 0 ||
+    value > 100
+  ) {
+    return null;
+  }
+
+  return value;
+}
+
+function sanitizeMufFactor(value) {
+  if (
+    value === null ||
+    value <= 0 ||
+    value > 10
+  ) {
+    return null;
+  }
+
+  return value;
+}
+
+function sanitizeHF2(value) {
+  if (
+    value === null ||
+    value < 100 ||
+    value > 1000
+  ) {
+    return null;
+  }
+
+  return value;
 }
 
 function parseGiroResponse(data) {
-  // split on any common newline sequence and search for the last line
+  if (typeof data !== 'string' || !data.trim()) {
+    throw new Error('Empty GIRO response');
+  }
+
   const lines = data.split(/\r?\n/);
 
-  let lastDataLine = null;
-
+  /*
+   * Recorremos la respuesta desde el final.
+   *
+   * GIRO puede devolver filas incompletas o respuestas en las que
+   * la última línea que contiene una fecha no es realmente una
+   * medición válida.
+   *
+   * En lugar de seleccionar simplemente la última línea con timestamp,
+   * buscamos la última fila que tenga una estructura válida y un foF2
+   * razonable.
+   */
   for (let i = lines.length - 1; i >= 0; i--) {
     const raw = lines[i];
-    if (!raw) continue;
+
+    if (!raw) {
+      continue;
+    }
+
     const line = raw.trim();
 
-    // Be tolerante: puede haber prefijos o espacios, buscamos la primera ocurrencia de timestamp
-    const match = line.match(/\d{4}-\d{2}-\d{2}T/);
-    if (match) {
-      // Extraemos desde la posición donde aparece el timestamp
-      lastDataLine = line.slice(match.index);
-      break;
+    if (!line) {
+      continue;
     }
+
+    /*
+     * Buscamos un timestamp ISO dentro de la línea.
+     *
+     * Ejemplo:
+     * 2026-09-05T17:05:01.000Z
+     */
+    const timestampMatch = line.match(
+      /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/
+    );
+
+    if (!timestampMatch) {
+      continue;
+    }
+
+    /*
+     * Puede existir algún prefijo antes del timestamp.
+     * Tomamos únicamente el contenido a partir de éste.
+     */
+    const dataLine = line.slice(timestampMatch.index);
+
+    const parts = dataLine.split(/\s+/);
+
+    /*
+     * Estructura esperada:
+     *
+     * timestamp
+     * confidence/status
+     *
+     * foF2 value + qualifier
+     * foEs value + qualifier
+     * MUF(D) value + qualifier
+     * M(D) value + qualifier
+     * h`F2 value + qualifier
+     *
+     * Necesitamos como mínimo:
+     *
+     * 2 campos fijos + 5 pares = 12 campos
+     */
+    if (parts.length < 12) {
+      logger.debug('Skipping incomplete GIRO data row', {
+        fieldCount: parts.length,
+        line: dataLine,
+      });
+
+      continue;
+    }
+
+    const timestamp = parts[0];
+    const measurementDate = new Date(timestamp);
+
+    if (Number.isNaN(measurementDate.getTime())) {
+      logger.debug('Skipping GIRO row with invalid timestamp', {
+        timestamp,
+        line: dataLine,
+      });
+
+      continue;
+    }
+
+    const cs = parseInt(parts[1], 10);
+    const tokens = parts.slice(2);
+
+    const rawFoF2 = parseGiroNumber(tokens[0]);
+    const rawFoEs = parseGiroNumber(tokens[2]);
+    const rawMufd = parseGiroNumber(tokens[4]);
+    const rawMd = parseGiroNumber(tokens[6]);
+    const rawHF2 = parseGiroNumber(tokens[8]);
+
+    /*
+     * foF2 es el parámetro fundamental para considerar una fila válida.
+     *
+     * Si aparece algo como 2026 significa que probablemente hemos
+     * interpretado una fecha u otro campo como foF2, por lo que se
+     * descarta la fila completa y seguimos buscando una anterior.
+     */
+    if (!isValidFoF2(rawFoF2)) {
+      logger.warn('Skipping GIRO row with invalid foF2', {
+        foF2: rawFoF2,
+        timestamp,
+        line: dataLine,
+      });
+
+      continue;
+    }
+
+    /*
+     * El resto de parámetros pueden faltar sin invalidar por completo
+     * la medición. En esos casos los devolvemos como null.
+     */
+    const foF2 = rawFoF2;
+    const foEs = sanitizeFoEs(rawFoEs);
+    const mufd = sanitizeMuf(rawMufd);
+    const md = sanitizeMufFactor(rawMd);
+    const hF2 = sanitizeHF2(rawHF2);
+
+    const ageMinutes = Math.floor(
+      (Date.now() - measurementDate.getTime()) /
+        (1000 * 60)
+    );
+
+    /*
+     * Evitamos aceptar mediciones fechadas claramente en el futuro.
+     * Se permite un pequeño margen para posibles diferencias de reloj.
+     */
+    if (ageMinutes < -5) {
+      logger.warn('Skipping GIRO row with future timestamp', {
+        timestamp,
+        ageMinutes,
+        line: dataLine,
+      });
+
+      continue;
+    }
+
+    const normalizedAgeMinutes = Math.max(
+      0,
+      ageMinutes
+    );
+
+    const freshness = computeFreshness(
+      normalizedAgeMinutes
+    );
+
+    logger.debug('Valid GIRO data row found', {
+      timestamp,
+      foF2,
+      foEs,
+      mufd,
+      mufFactor: md,
+      hF2,
+      ageMinutes: normalizedAgeMinutes,
+      freshness,
+    });
+
+    return {
+      timestamp: measurementDate.toISOString(),
+      foF2,
+      mufd,
+      mufFactor: md,
+      hF2,
+      foEs,
+      confidence: Number.isFinite(cs)
+        ? cs
+        : null,
+      ageMinutes: normalizedAgeMinutes,
+      freshness,
+    };
   }
 
-  if (!lastDataLine) {
-    throw new Error('No data found in GIRO response');
-  }
-
-  const parts = lastDataLine.split(/\s+/);
-
-  const timestamp = parts[0];
-  const cs = parseInt(parts[1], 10);
-
-  const tokens = parts.slice(2);
-
-  const foF2 = parseGiroNumber(tokens[0]);
-  const foEs = parseGiroNumber(tokens[2]);
-  const mufd = parseGiroNumber(tokens[4]);
-  const md = parseGiroNumber(tokens[6]);
-  const hF2 = parseGiroNumber(tokens[8]);
-
-  const measurementDate = new Date(timestamp);
-
-  if (Number.isNaN(measurementDate.getTime())) {
-    throw new Error(`Invalid timestamp in GIRO response: ${timestamp}`);
-  }
-
-  const now = new Date();
-  const ageMinutes = Math.floor((now - measurementDate) / (1000 * 60));
-
-  const freshness = computeFreshness(ageMinutes);
-
-  logger.debug('parseGiroResponse calculated ageMinutes', {
-    timestamp,
-    measurementDate: measurementDate.toISOString(),
-    ageMinutes,
-    freshness,
-  });
-
-  return {
-    timestamp: measurementDate.toISOString(),
-    foF2,
-    mufd,
-    mufFactor: md,
-    hF2,
-    foEs,
-    confidence: Number.isFinite(cs) ? cs : null,
-    ageMinutes,
-    freshness,
-  };
+  throw new Error(
+    'No valid ionospheric measurement found in GIRO response'
+  );
 }
 
 exports.getHFData = async (req, res) => {
-  logger.info('➡️ Received GET request /api/ionosphere/hf');
+  logger.info(
+    '➡️ Received GET request /api/ionosphere/hf'
+  );
 
   try {
-    const { lat, lon, station } = req.query;
-    const stationId = Array.isArray(station) ? station[0] : station;
+    const {
+      lat,
+      lon,
+      station,
+    } = req.query;
+
+    const stationId = Array.isArray(station)
+      ? station[0]
+      : station;
 
     let selectedStation = null;
 
     if (stationId) {
-      selectedStation = findStationById(stationId);
+      selectedStation =
+        findStationById(stationId);
 
       if (!selectedStation) {
-        logger.warn('Unknown station requested', { stationId });
-        return res.status(400).json({ error: `Unknown station id: ${stationId}` });
+        logger.warn(
+          'Unknown station requested',
+          {
+            stationId,
+          }
+        );
+
+        return res.status(400).json({
+          error: `Unknown station id: ${stationId}`,
+        });
       }
     }
 
     let nearestStation = null;
 
     if (selectedStation) {
-      nearestStation = { ...selectedStation, distance: null };
+      nearestStation = {
+        ...selectedStation,
+        distance: null,
+      };
 
-      // Si nos pasan coordenadas junto con el id de estación, calcular la distancia
-      if (lat !== undefined && lon !== undefined) {
-        const userLat = parseFloat(Array.isArray(lat) ? lat[0] : lat);
-        const userLon = parseFloat(Array.isArray(lon) ? lon[0] : lon);
+      /*
+       * Si nos pasan coordenadas junto con el id de estación,
+       * calculamos también la distancia.
+       */
+      if (
+        lat !== undefined &&
+        lon !== undefined
+      ) {
+        const userLat = parseFloat(
+          Array.isArray(lat)
+            ? lat[0]
+            : lat
+        );
 
-        if (!Number.isNaN(userLat) && !Number.isNaN(userLon)) {
-          nearestStation.distance = calculateDistance(userLat, userLon, selectedStation.lat, selectedStation.lon);
-          logger.info('Computed distance for selected station from provided coords', {
-            station: selectedStation.name,
-            distance: nearestStation.distance.toFixed(2),
-          });
+        const userLon = parseFloat(
+          Array.isArray(lon)
+            ? lon[0]
+            : lon
+        );
+
+        if (isValidCoordinates(userLat, userLon)) {
+          nearestStation.distance =
+            calculateDistance(
+              userLat,
+              userLon,
+              selectedStation.lat,
+              selectedStation.lon
+            );
+
+          logger.info(
+            'Computed distance for selected station from provided coords',
+            {
+              station:
+                selectedStation.name,
+
+              distance:
+                nearestStation.distance.toFixed(
+                  2
+                ),
+            }
+          );
+        } else {
+          logger.warn(
+            'Ignoring invalid coordinates supplied with selected station',
+            {
+              lat,
+              lon,
+            }
+          );
         }
       }
 
-      logger.info('Using selected station from request', { station: selectedStation.name });
+      logger.info(
+        'Using selected station from request',
+        {
+          station: selectedStation.name,
+        }
+      );
     } else {
-      if (lat === undefined || lon === undefined) {
-        logger.warn('Missing lat or lon parameters');
-        return res.status(400).json({ error: 'station or lat and lon parameters are required' });
+      if (
+        lat === undefined ||
+        lon === undefined
+      ) {
+        logger.warn(
+          'Missing lat or lon parameters'
+        );
+
+        return res.status(400).json({
+          error:
+            'station or lat and lon parameters are required',
+        });
       }
 
-      const userLat = parseFloat(Array.isArray(lat) ? lat[0] : lat);
-      const userLon = parseFloat(Array.isArray(lon) ? lon[0] : lon);
+      const userLat = parseFloat(
+        Array.isArray(lat)
+          ? lat[0]
+          : lat
+      );
 
-      if (Number.isNaN(userLat) || Number.isNaN(userLon)) {
-        logger.warn('Invalid lat or lon values');
-        return res.status(400).json({ error: 'lat and lon must be valid numbers' });
+      const userLon = parseFloat(
+        Array.isArray(lon)
+          ? lon[0]
+          : lon
+      );
+
+      if (!isValidCoordinates(userLat, userLon)) {
+        logger.warn(
+          'Invalid lat or lon values',
+          {
+            lat,
+            lon,
+          }
+        );
+
+        return res.status(400).json({
+          error:
+            'lat must be between -90 and 90 and lon between -180 and 180',
+        });
       }
 
-      nearestStation = findNearestStation(userLat, userLon);
+      nearestStation =
+        findNearestStation(
+          userLat,
+          userLon
+        );
 
       if (!nearestStation) {
-        logger.warn('No GIRO station found');
-        return res.status(500).json({ error: 'No GIRO station available' });
+        logger.warn(
+          'No GIRO station found'
+        );
+
+        return res.status(500).json({
+          error:
+            'No GIRO station available',
+        });
       }
 
-      logger.info('Nearest station found', {
-        station: nearestStation.name,
-        distance: nearestStation.distance.toFixed(2),
-      });
+      logger.info(
+        'Nearest station found',
+        {
+          station:
+            nearestStation.name,
+
+          distance:
+            nearestStation.distance.toFixed(
+              2
+            ),
+        }
+      );
     }
 
-    const cachedResponse = getCachedData(nearestStation);
+    const cachedResponse =
+      getCachedData(nearestStation);
 
     if (cachedResponse) {
-      logger.info('Serving GIRO data from cache', {
-        station: nearestStation.name,
-        cacheAgeSeconds: cachedResponse.cacheAgeSeconds,
-        ageMinutes: cachedResponse.ageMinutes,
-        freshness: cachedResponse.freshness,
-        measuredAt: cachedResponse.measuredAt,
-      });
+      logger.info(
+        'Serving GIRO data from cache',
+        {
+          station:
+            nearestStation.name,
 
-      // No mutamos la caché aquí; construimos una copia y sobrescribimos distanceKm
+          cacheAgeSeconds:
+            cachedResponse.cacheAgeSeconds,
+
+          ageMinutes:
+            cachedResponse.ageMinutes,
+
+          freshness:
+            cachedResponse.freshness,
+
+          measuredAt:
+            cachedResponse.measuredAt,
+        }
+      );
+
       const responseToSend = {
         ...cachedResponse,
+
         station: {
           ...cachedResponse.station,
+
           distanceKm:
-            nearestStation && nearestStation.distance != null
-              ? Number(nearestStation.distance.toFixed(2))
-              : cachedResponse.station.distanceKm,
+            nearestStation.distance != null
+              ? Number(
+                  nearestStation.distance.toFixed(
+                    2
+                  )
+                )
+              : cachedResponse.station
+                  .distanceKm,
         },
       };
 
-      return res.json(responseToSend);
+      return res.json(
+        responseToSend
+      );
     }
 
     const now = new Date();
-    const toDate = new Date(now);
-    const fromDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);  // Extender búsqueda a 24 horas para obtener datos más recientes
 
-    const fromDateStr = formatGiroDate(fromDate);
-    const toDateStr = formatGiroDate(toDate);
+    /*
+     * Buscar hasta 24 horas atrás para obtener la última
+     * medición disponible de la estación.
+     */
+    const fromDate = new Date(
+      now.getTime() -
+        24 * 60 * 60 * 1000
+    );
 
     const params = {
-      ursiCode: nearestStation.ursi,
-      charName: 'foF2,foEs,MUF(D),M(D),h`F2',
+      ursiCode:
+        nearestStation.ursi,
+
+      charName:
+        'foF2,foEs,MUF(D),M(D),h`F2',
+
       DMUF: 3000,
-      fromDate: fromDateStr,
-      toDate: toDateStr,
+
+      fromDate:
+        formatGiroDate(fromDate),
+
+      toDate:
+        formatGiroDate(now),
     };
 
-    const queryString = new URLSearchParams(params).toString();
+    const queryString =
+      new URLSearchParams(
+        params
+      ).toString();
 
-    logger.info('GIRO request URL', {
-      url: `${GIRO_BASE_URL}?${queryString}`,
-    });
+    logger.info(
+      'GIRO request URL',
+      {
+        url: `${GIRO_BASE_URL}?${queryString}`,
+      }
+    );
 
-    const giroResponse = await axios.get(GIRO_BASE_URL, {
-      params,
-      timeout: 10000,
-    });
+    const giroResponse =
+      await axios.get(
+        GIRO_BASE_URL,
+        {
+          params,
+          timeout: 10000,
+        }
+      );
 
-    logger.info('GIRO response received', {
-      status: giroResponse.status,
-      dataLength: giroResponse.data.length,
-    });
+    logger.info(
+      'GIRO response received',
+      {
+        station:
+          nearestStation.name,
+
+        ursiCode:
+          nearestStation.ursi,
+
+        status:
+          giroResponse.status,
+
+        dataLength:
+          typeof giroResponse.data ===
+          'string'
+            ? giroResponse.data.length
+            : null,
+      }
+    );
 
     let parsedData;
+
     try {
-      parsedData = parseGiroResponse(giroResponse.data);
+      parsedData =
+        parseGiroResponse(
+          giroResponse.data
+        );
     } catch (err) {
-      // Log a snippet of the GIRO response to help debugging when parsing fails
-      const snippet = typeof giroResponse.data === 'string' ? giroResponse.data.slice(0, 2000) : String(giroResponse.data);
-      logger.error('Failed to parse GIRO response', { error: err.message, snippet });
+      /*
+       * Guardamos un fragmento de la respuesta para poder investigar
+       * cambios de formato o respuestas incompletas de GIRO.
+       */
+      const snippet =
+        typeof giroResponse.data ===
+        'string'
+          ? giroResponse.data.slice(
+              0,
+              2000
+            )
+          : String(
+              giroResponse.data
+            );
+
+      logger.error(
+        'Failed to parse GIRO response',
+        {
+          station:
+            nearestStation.name,
+
+          ursiCode:
+            nearestStation.ursi,
+
+          error:
+            err.message,
+
+          snippet,
+        }
+      );
+
       throw err;
     }
 
     const response = {
       cached: false,
+
       station: {
-        ursiCode: nearestStation.ursi,
-        name: nearestStation.name,
-        distanceKm: nearestStation.distance != null ? Number(nearestStation.distance.toFixed(2)) : null,
+        ursiCode:
+          nearestStation.ursi,
+
+        name:
+          nearestStation.name,
+
+        distanceKm:
+          nearestStation.distance !=
+          null
+            ? Number(
+                nearestStation.distance.toFixed(
+                  2
+                )
+              )
+            : null,
       },
-      measuredAt: parsedData.timestamp,
-      foF2: parsedData.foF2,
-      muf: parsedData.mufd,
-      mufFactor: parsedData.mufFactor,
-      hF2: parsedData.hF2,
-      foEs: parsedData.foEs,
-      confidence: parsedData.confidence,
-      ageMinutes: parsedData.ageMinutes,
-      freshness: parsedData.freshness,
+
+      measuredAt:
+        parsedData.timestamp,
+
+      foF2:
+        parsedData.foF2,
+
+      muf:
+        parsedData.mufd,
+
+      mufFactor:
+        parsedData.mufFactor,
+
+      hF2:
+        parsedData.hF2,
+
+      foEs:
+        parsedData.foEs,
+
+      confidence:
+        parsedData.confidence,
+
+      ageMinutes:
+        parsedData.ageMinutes,
+
+      freshness:
+        parsedData.freshness,
     };
 
-    saveCachedData(nearestStation, response);
+    saveCachedData(
+      nearestStation,
+      response
+    );
 
-    logger.info('Response sent for /api/ionosphere/hf', {
-      station: nearestStation.name,
-      foF2: parsedData.foF2,
-      muf: parsedData.mufd,
-      mufFactor: parsedData.mufFactor,
-      cached: false,
-    });
+    logger.info(
+      'Response sent for /api/ionosphere/hf',
+      {
+        station:
+          nearestStation.name,
+
+        foF2:
+          parsedData.foF2,
+
+        muf:
+          parsedData.mufd,
+
+        mufFactor:
+          parsedData.mufFactor,
+
+        cached: false,
+      }
+    );
 
     return res.json(response);
   } catch (error) {
     if (error.response) {
-      logger.error('GIRO API error', {
-        status: error.response.status,
-        statusText: error.response.statusText,
-        requestUrl: error.config?.url,
-        requestParams: error.config?.params,
-        data: error.response.data,
-      });
+      logger.error(
+        'GIRO API error',
+        {
+          status:
+            error.response.status,
 
-      return res.status(500).json({ error: 'Failed to fetch data from GIRO service' });
+          statusText:
+            error.response.statusText,
+
+          requestUrl:
+            error.config?.url,
+
+          requestParams:
+            error.config?.params,
+
+          data:
+            error.response.data,
+        }
+      );
+
+      return res.status(500).json({
+        error:
+          'Failed to fetch data from GIRO service',
+      });
     }
 
-    logger.error('Error in /api/ionosphere/hf', { error: error.message });
-    return res.status(500).json({ error: error.message || 'Server error' });
+    logger.error(
+      'Error in /api/ionosphere/hf',
+      {
+        error:
+          error.message,
+      }
+    );
+
+    return res.status(500).json({
+      error:
+        error.message ||
+        'Server error',
+    });
   }
 };
 
-exports.getStations = (req, res) => {
-  const stationList = stations.map(({ ursi, name }) => ({ ursi, name }));
-  return res.json(stationList);
+exports.getStations = (
+  req,
+  res
+) => {
+  const stationList =
+    stations.map(
+      ({
+        ursi,
+        name,
+      }) => ({
+        ursi,
+        name,
+      })
+    );
+
+  return res.json(
+    stationList
+  );
 };
