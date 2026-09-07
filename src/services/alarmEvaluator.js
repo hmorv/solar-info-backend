@@ -132,14 +132,20 @@ async function evaluateSolarAlarms(reading) {
     const [alarms] =
       await connection.execute(`
         SELECT
-          id,
-          installation_id,
-          parameter,
-          condition_type,
-          threshold_value,
-          last_state
-        FROM alarms
-        WHERE enabled = 1
+          a.id,
+          a.installation_id,
+          a.parameter,
+          a.condition_type,
+          a.threshold_value,
+          a.last_state,
+          pd.installation_id AS device_installation_id,
+          pd.push_token,
+          pd.notifications_enabled,
+          pd.language
+        FROM alarms a
+        LEFT JOIN push_devices pd
+          ON pd.installation_id = a.installation_id
+        WHERE a.enabled = 1
       `);
 
     for (const alarm of alarms) {
@@ -193,27 +199,53 @@ async function evaluateSolarAlarms(reading) {
       /*
        * The condition is met and has not yet
        * been successfully notified.
+       *
+       * Device information has already been
+       * loaded with the alarm query above.
        */
       const pushResult =
         await sendAlarmNotification(
           alarm,
-          currentValue
+          currentValue,
+          {
+            exists: Boolean(
+              alarm.device_installation_id
+            ),
+            pushToken: alarm.push_token,
+            notificationsEnabled: Boolean(
+              alarm.notifications_enabled
+            ),
+            language: alarm.language,
+          }
         );
 
       /*
        * Keep last_state = 0 whenever the push
-       * has not been successfully delivered to
+       * has not been successfully accepted by
        * FCM.
        *
        * This allows the alarm to be retried on
        * a future collector cycle.
-       *
-       * Expected device states such as disabled
-       * notifications or a missing token are not
-       * logged here on every cycle.
        */
       if (pushResult.status !== 'sent') {
-        if (pushResult.status === 'failed') {
+        if (
+          pushResult.status === 'invalid-token'
+        ) {
+          await connection.execute(
+            `
+              UPDATE push_devices
+              SET push_token = NULL
+              WHERE installation_id = ?
+            `,
+            [alarm.installation_id]
+          );
+
+          logger.warn(
+            `Invalid push token for installation ${alarm.installation_id}; token removed`
+          );
+        } else if (
+          pushResult.status === 'failed'
+        ) {
           logger.warn(
             `Alarm ${alarm.id} remains pending after push failure`
           );
