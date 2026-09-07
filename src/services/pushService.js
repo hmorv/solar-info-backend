@@ -1,4 +1,3 @@
-const { getConnection } = require('../config/mysql');
 const { getMessaging } = require('../config/firebase');
 const logger = require('../config/logger');
 
@@ -221,142 +220,110 @@ const INVALID_TOKEN_ERRORS = new Set([
 
 async function sendAlarmNotification(
   alarm,
-  currentValue
+  currentValue,
+  device
 ) {
-  let connection;
+  /*
+   * Device information is loaded by alarmEvaluator
+   * together with the alarm itself.
+   *
+   * pushService is deliberately database-agnostic:
+   * its responsibility is only deciding whether a
+   * push can be attempted and sending it through FCM.
+   */
+  if (!device?.exists) {
+    return {
+      status: 'no-device',
+    };
+  }
 
-  try {
-    connection = await getConnection();
+  if (!device.notificationsEnabled) {
+    return {
+      status: 'disabled',
+    };
+  }
 
-    const [rows] =
-      await connection.execute(
-        `
-          SELECT
-            push_token,
-            notifications_enabled,
-            language
-          FROM push_devices
-          WHERE installation_id = ?
-          LIMIT 1
-        `,
-        [alarm.installation_id]
-      );
+  if (!device.pushToken) {
+    return {
+      status: 'no-token',
+    };
+  }
 
-    if (!rows.length) {
-      return {
-        status: 'no-device',
-      };
-    }
+  const language =
+    normalizeLanguage(device.language);
 
-    const device = rows[0];
+  const message = {
+    token: device.pushToken,
 
-    if (!device.notifications_enabled) {
-      return {
-        status: 'disabled',
-      };
-    }
+    notification: {
+      title: 'DXSun',
+      body: buildAlarmMessage(
+        alarm,
+        currentValue,
+        language
+      ),
+    },
 
-    if (!device.push_token) {
-      return {
-        status: 'no-token',
-      };
-    }
+    data: {
+      type: 'solar-alarm',
+      alarmId: String(alarm.id),
+      parameter: String(alarm.parameter),
+      condition: String(
+        alarm.condition_type
+      ),
+      threshold: String(
+        alarm.threshold_value
+      ),
+      currentValue: String(
+        currentValue
+      ),
+      language,
+    },
 
-    const language =
-      normalizeLanguage(device.language);
-
-    const message = {
-      token: device.push_token,
+    android: {
+      priority: 'high',
+      ttl: 30 * 60 * 1000,
 
       notification: {
-        title: 'DXSun',
-        body: buildAlarmMessage(
-          alarm,
-          currentValue,
-          language
-        ),
+        channelId: 'dxsun_alerts',
       },
+    },
+  };
 
-      data: {
-        type: 'solar-alarm',
-        alarmId: String(alarm.id),
-        parameter: String(alarm.parameter),
-        condition: String(
-          alarm.condition_type
-        ),
-        threshold: String(
-          alarm.threshold_value
-        ),
-        currentValue: String(
-          currentValue
-        ),
-        language,
-      },
+  try {
+    const response =
+      await getMessaging().send(message);
 
-      android: {
-        priority: 'high',
-        ttl: 30 * 60 * 1000,
+    logger.info(
+      `Push sent for alarm ${alarm.id}: ${response}`
+    );
 
-        notification: {
-          channelId: 'dxsun_alerts',
-        },
-      },
+    return {
+      status: 'sent',
+      messageId: response,
     };
-
-    try {
-      const response =
-        await getMessaging().send(message);
-
-      logger.info(
-        `Push sent for alarm ${alarm.id}: ${response}`
-      );
-
+  } catch (error) {
+    if (isInvalidTokenError(error)) {
+      /*
+       * Do not access the database here.
+       *
+       * alarmEvaluator receives this status and is
+       * responsible for clearing the invalid token
+       * using the connection it already owns.
+       */
       return {
-        status: 'sent',
-        messageId: response,
-      };
-    } catch (error) {
-      if (isInvalidTokenError(error)) {
-        logger.warn(
-          `Invalid push token for installation ${alarm.installation_id}; token removed`
-        );
-
-        await connection.execute(
-          `
-            UPDATE push_devices
-            SET push_token = NULL
-            WHERE installation_id = ?
-          `,
-          [alarm.installation_id]
-        );
-
-        return {
-          status: 'invalid-token',
-        };
-      }
-
-      logger.error(
-        `Push notification failed for alarm ${alarm.id}: ${error.message}`
-      );
-
-      return {
-        status: 'failed',
-        error,
+        status: 'invalid-token',
       };
     }
-  } catch (error) {
+
     logger.error(
-      `Push notification processing failed for alarm ${alarm.id}: ${error.message}`
+      `Push notification failed for alarm ${alarm.id}: ${error.message}`
     );
 
     return {
       status: 'failed',
       error,
     };
-  } finally {
-    if (connection) {
-      await connection.end();
-    }
   }
 }
 

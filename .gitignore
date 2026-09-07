@@ -1,7 +1,12 @@
 node_modules/
-# Ignore Firebase Admin / Service Account credentials (High Security)
+
+.env
+.env.*
+!.env.example
+
+firebase-service-account.json
 *-firebase-adminsdk-*.json
-
-
-# Ignore Android Client Configuration (Optional, but recommended for public repos)
 google-services.json
+
+logs/
+*.log
