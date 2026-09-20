@@ -15,6 +15,25 @@ const alarmsRoutes = require('./routes/alarms');
 
 const app = express();
 
+function getTelemetryHeader(req, name) {
+  const value = req.get(name);
+
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, 128) : null;
+}
+
+function getInstallId(req) {
+  const installId = getTelemetryHeader(req, 'X-DXSun-Install-ID');
+
+  return installId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(installId)
+    ? installId
+    : null;
+}
+
 app.set('trust proxy', true);
 app.disable('x-powered-by');
 
@@ -35,10 +54,25 @@ app.use(express.json());
 
 app.use(
   morgan(
-    ':remote-addr - :remote-user [:date[iso]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"',
+    (tokens, req, res) => JSON.stringify({
+      remoteAddr: tokens['remote-addr'](req, res),
+      remoteUser: tokens['remote-user'](req, res),
+      date: tokens.date(req, res, 'iso'),
+      method: tokens.method(req, res),
+      url: tokens.url(req, res),
+      httpVersion: tokens['http-version'](req, res),
+      status: Number(tokens.status(req, res)),
+      contentLength: tokens.res(req, res, 'content-length'),
+      referrer: tokens.referrer(req, res),
+      userAgent: tokens['user-agent'](req, res),
+      version: getTelemetryHeader(req, 'X-DXSun-Version'),
+      build: getTelemetryHeader(req, 'X-DXSun-Build'),
+      platform: getTelemetryHeader(req, 'X-DXSun-Platform'),
+      installId: getInstallId(req),
+    }),
     {
       stream: {
-        write: (message) => logger.info(message.trim()),
+        write: (message) => logger.info('HTTP request', JSON.parse(message)),
       },
     }
   )

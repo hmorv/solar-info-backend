@@ -3,18 +3,23 @@ const { getConnection } = require('../config/mysql');
 const ALLOWED_PLATFORMS = new Set([
   'android',
   'ios',
+  'web',
 ]);
 
 const ALLOWED_LANGUAGES = new Set([
   'en',
+  'fr',
   'es',
   'ca',
   'de',
   'eu',
   'gl',
   'it',
+  'ja',
+  'pl',
   'pt',
   'ru',
+  'zh',
 ]);
 
 function isValidInstallationId(value) {
@@ -81,7 +86,7 @@ async function registerDevice(req, res, next) {
 
   if (!isValidPlatform(platform)) {
     return res.status(400).json({
-      error: 'platform must be android or ios',
+      error: 'platform must be android, ios, or web',
     });
   }
 

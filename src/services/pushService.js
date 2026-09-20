@@ -60,6 +60,25 @@ const TRANSLATIONS = {
     },
   },
 
+  fr: {
+    now: 'Maintenant',
+    parameters: {
+      solarflux: 'Flux solaire',
+      aindex: 'Indice A',
+      kindex: 'Indice K',
+      xray: 'Rayons X',
+      sunspots: 'Taches solaires',
+      heliumline: 'Raie de l helium',
+      protonflux: 'Flux de protons',
+      electronflux: 'Flux d electrons',
+      aurora: 'Aurore',
+      normalization: 'Normalisation',
+      latdegree: 'Latitude',
+      solarwind: 'Vent solaire',
+      magneticfield: 'Champ magnetique',
+    },
+  },
+
   es: {
     now: 'Actual',
     parameters: {
@@ -209,6 +228,63 @@ const TRANSLATIONS = {
       latdegree: 'Широта',
       solarwind: 'Солнечный ветер',
       magneticfield: 'Магнитное поле',
+    },
+  },
+
+  ja: {
+    now: '現在',
+    parameters: {
+      solarflux: '太陽フラックス',
+      aindex: 'A指数',
+      kindex: 'K指数',
+      xray: 'X線',
+      sunspots: '黒点数',
+      heliumline: 'ヘリウム線',
+      protonflux: '陽子フラックス',
+      electronflux: '電子フラックス',
+      aurora: 'オーロラ',
+      normalization: '正規化',
+      latdegree: '緯度',
+      solarwind: '太陽風',
+      magneticfield: '磁場',
+    },
+  },
+
+  pl: {
+    now: 'Teraz',
+    parameters: {
+      solarflux: 'Strumień słoneczny',
+      aindex: 'Indeks A',
+      kindex: 'Indeks K',
+      xray: 'Promieniowanie X',
+      sunspots: 'Plamy słoneczne',
+      heliumline: 'Linia helu',
+      protonflux: 'Strumień protonów',
+      electronflux: 'Strumień elektronów',
+      aurora: 'Zorza polarna',
+      normalization: 'Normalizacja',
+      latdegree: 'Szerokość geograficzna',
+      solarwind: 'Wiatr słoneczny',
+      magneticfield: 'Pole magnetyczne',
+    },
+  },
+
+  zh: {
+    now: '当前',
+    parameters: {
+      solarflux: '太阳通量',
+      aindex: 'A指数',
+      kindex: 'K指数',
+      xray: 'X射线',
+      sunspots: '太阳黑子',
+      heliumline: '氦线',
+      protonflux: '质子通量',
+      electronflux: '电子通量',
+      aurora: '极光',
+      normalization: '归一化',
+      latdegree: '纬度',
+      solarwind: '太阳风',
+      magneticfield: '磁场',
     },
   },
 };
