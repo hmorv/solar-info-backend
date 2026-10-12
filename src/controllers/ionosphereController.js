@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../config/logger');
 const stations = require('../config/stations');
+const diasService = require('../services/diasService');
 
 const GIRO_BASE_URL = 'https://lgdc.uml.edu/fastchar/getbest';
 
@@ -39,16 +40,135 @@ const STALE_CACHE_MAX_MS =
 const CACHE_FILE_PATH =
   process.env.GIRO_CACHE_FILE ||
   path.join(__dirname, '../../data/giro-cache.json');
+const DIAS_CACHE_FILE_PATH =
+  process.env.DIAS_CACHE_FILE ||
+  path.join(__dirname, '../../data/dias-cache.json');
 
 const giroCache = new Map();
+const diasCache = new Map();
+const providerRequestsInFlight = new Map();
+
+function getPositiveEnvironmentNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const AUTO_MAX_DISTANCE_KM = getPositiveEnvironmentNumber(
+  'IONOSPHERE_AUTO_MAX_DISTANCE_KM',
+  500
+);
+const MAX_OBSERVATION_AGE_MINUTES = getPositiveEnvironmentNumber(
+  'IONOSPHERE_MAX_OBSERVATION_AGE_MINUTES',
+  30
+);
+const AUTO_MAX_ATTEMPTS = Math.max(
+  1,
+  Math.floor(getPositiveEnvironmentNumber('IONOSPHERE_AUTO_MAX_ATTEMPTS', 3))
+);
+
+function getProviderCache(provider) {
+  return provider === 'dias'
+    ? diasCache
+    : giroCache;
+}
+
+function getProviderCacheFile(provider) {
+  return provider === 'dias'
+    ? DIAS_CACHE_FILE_PATH
+    : CACHE_FILE_PATH;
+}
+
+function getConfiguredProvider() {
+  const mode =
+    (process.env.IONOSPHERE_PROVIDER || 'hybrid')
+      .trim()
+      .toLowerCase();
+  const preferredProvider =
+    (process.env.IONOSPHERE_PREFERRED_PROVIDER || 'dias')
+      .trim()
+      .toLowerCase();
+
+  if (
+    ['dias', 'giro', 'hybrid'].includes(mode) &&
+    (mode !== 'hybrid' || ['dias', 'giro'].includes(preferredProvider))
+  ) {
+    return { mode, preferredProvider };
+  }
+
+  logger.error(
+    'Invalid ionosphere provider configuration',
+    {
+      configuredProvider: mode,
+      configuredPreferredProvider: preferredProvider,
+      allowedProviders: ['dias', 'giro', 'hybrid'],
+      allowedPreferredProviders: ['dias', 'giro'],
+    }
+  );
+
+  return null;
+}
+
+function getProviderPlan({ mode, preferredProvider }, station) {
+  if (mode !== 'hybrid') {
+    return [mode];
+  }
+
+  const supportsDias = diasService.SUPPORTED_STATIONS.has(
+    station.ursi.toUpperCase()
+  );
+
+  if (!supportsDias) {
+    return ['giro'];
+  }
+
+  const secondaryProvider = preferredProvider === 'dias' ? 'giro' : 'dias';
+  return [preferredProvider, secondaryProvider];
+}
 
 function getCacheKey(station) {
   return station.ursi.toUpperCase();
 }
 
-function persistCacheToDisk() {
+function fetchProviderMeasurement(provider, station) {
+  const requestKey = `${provider}:${getCacheKey(station)}`;
+  const inFlightRequest = providerRequestsInFlight.get(requestKey);
+
+  if (inFlightRequest) {
+    return inFlightRequest;
+  }
+
+  const request = provider === 'dias'
+    ? diasService.fetchLatest(station.ursi)
+    : fetchGiroMeasurement(station);
+
+  providerRequestsInFlight.set(requestKey, request);
+  return request.finally(() => {
+    providerRequestsInFlight.delete(requestKey);
+  });
+}
+
+function getDiasCandidates(lat, lon) {
+  return stations
+    .filter((station) => diasService.SUPPORTED_STATIONS.has(station.ursi.toUpperCase()))
+    .map((station) => ({
+      ...station,
+      distance: calculateDistance(lat, lon, station.lat, station.lon),
+    }))
+    .sort((left, right) => left.distance - right.distance);
+}
+
+function isObservationWithinAge(data, maxAgeMinutes) {
+  const measuredAtMs = new Date(data?.measuredAt || data?.timestamp).getTime();
+  return Number.isFinite(measuredAtMs) &&
+    measuredAtMs <= Date.now() &&
+    Date.now() - measuredAtMs <= maxAgeMinutes * 60 * 1000;
+}
+
+function persistCacheToDisk(provider = 'giro') {
   try {
-    const directory = path.dirname(CACHE_FILE_PATH);
+    const cacheFilePath = getProviderCacheFile(provider);
+    const cache = getProviderCache(provider);
+    const directory = path.dirname(cacheFilePath);
 
     fs.mkdirSync(directory, {
       recursive: true,
@@ -56,7 +176,7 @@ function persistCacheToDisk() {
 
     const stationsCache = {};
 
-    for (const [key, entry] of giroCache.entries()) {
+    for (const [key, entry] of cache.entries()) {
       stationsCache[key] = {
         cachedAt: new Date(entry.cachedAt).toISOString(),
         data: entry.data,
@@ -75,7 +195,7 @@ function persistCacheToDisk() {
      * Así reducimos el riesgo de dejar giro-cache.json incompleto
      * si el proceso se interrumpe durante la escritura.
      */
-    const tempFile = `${CACHE_FILE_PATH}.tmp`;
+    const tempFile = `${cacheFilePath}.tmp`;
 
     fs.writeFileSync(
       tempFile,
@@ -85,13 +205,14 @@ function persistCacheToDisk() {
 
     fs.renameSync(
       tempFile,
-      CACHE_FILE_PATH
+      cacheFilePath
     );
 
     logger.debug(
-      'GIRO persistent cache saved',
+      'Ionosphere persistent cache saved',
       {
-        file: CACHE_FILE_PATH,
+        provider,
+        file: cacheFilePath,
         stations:
           Object.keys(stationsCache).length,
       }
@@ -102,22 +223,27 @@ function persistCacheToDisk() {
      * que el endpoint siga funcionando.
      */
     logger.error(
-      'Failed to persist GIRO cache',
+      'Failed to persist ionosphere cache',
       {
-        file: CACHE_FILE_PATH,
+        provider,
+        file: getProviderCacheFile(provider),
         error: error.message,
       }
     );
   }
 }
 
-function loadPersistentCache() {
+function loadPersistentCache(provider = 'giro') {
   try {
-    if (!fs.existsSync(CACHE_FILE_PATH)) {
+    const cacheFilePath = getProviderCacheFile(provider);
+    const cache = getProviderCache(provider);
+
+    if (!fs.existsSync(cacheFilePath)) {
       logger.info(
-        'No persistent GIRO cache found',
+        'No persistent ionosphere cache found',
         {
-          file: CACHE_FILE_PATH,
+          provider,
+          file: cacheFilePath,
         }
       );
 
@@ -126,7 +252,7 @@ function loadPersistentCache() {
 
     const raw =
       fs.readFileSync(
-        CACHE_FILE_PATH,
+        cacheFilePath,
         'utf8'
       );
 
@@ -171,10 +297,13 @@ function loadPersistentCache() {
         continue;
       }
 
-      giroCache.set(
+      cache.set(
         key.toUpperCase(),
         {
-          data: entry.data,
+          data: {
+            ...entry.data,
+            source: entry.data.source || provider,
+          },
           cachedAt: cachedAtMs,
         }
       );
@@ -183,9 +312,10 @@ function loadPersistentCache() {
     }
 
     logger.info(
-      'Persistent GIRO cache loaded',
+      'Persistent ionosphere cache loaded',
       {
-        file: CACHE_FILE_PATH,
+        provider,
+        file: cacheFilePath,
         loaded,
         discarded,
       }
@@ -196,16 +326,17 @@ function loadPersistentCache() {
      * sin ellas.
      */
     if (discarded > 0) {
-      persistCacheToDisk();
+      persistCacheToDisk(provider);
     }
   } catch (error) {
     /*
      * Una caché corrupta tampoco debe impedir arrancar DXSun.
      */
     logger.error(
-      'Failed to load persistent GIRO cache',
+      'Failed to load persistent ionosphere cache',
       {
-        file: CACHE_FILE_PATH,
+        provider,
+        file: getProviderCacheFile(provider),
         error: error.message,
       }
     );
@@ -216,13 +347,14 @@ function getCachedData(
   station,
   {
     allowStale = false,
-  } = {}
+  } = {},
+  provider = 'giro'
 ) {
   const key =
     getCacheKey(station);
 
   const entry =
-    giroCache.get(key);
+    getProviderCache(provider).get(key);
 
   if (!entry) {
     return null;
@@ -242,9 +374,9 @@ function getCachedData(
     cacheAgeMs >
     STALE_CACHE_MAX_MS
   ) {
-    giroCache.delete(key);
+    getProviderCache(provider).delete(key);
 
-    persistCacheToDisk();
+    persistCacheToDisk(provider);
 
     return null;
   }
@@ -350,16 +482,18 @@ function getCachedData(
 
 function saveCachedData(
   station,
-  data
+  data,
+  provider = 'giro'
 ) {
   const key =
     getCacheKey(station);
 
-  giroCache.set(
+  getProviderCache(provider).set(
     key,
     {
       data: {
         ...data,
+        source: data.source || provider,
       },
 
       cachedAt:
@@ -371,7 +505,7 @@ function saveCachedData(
    * Cada respuesta válida de GIRO actualiza también la copia
    * persistente.
    */
-  persistCacheToDisk();
+  persistCacheToDisk(provider);
 }
 
 function buildCachedResponse(
@@ -400,10 +534,41 @@ function buildCachedResponse(
   };
 }
 
+function buildProviderResponse(
+  nearestStation,
+  parsedData,
+  provider,
+  selectionMode
+) {
+  return {
+    cached: false,
+    source: provider,
+    selectionMode,
+    station: {
+      ursiCode: nearestStation.ursi,
+      name: nearestStation.name,
+      distanceKm:
+        nearestStation.distance != null
+          ? Number(nearestStation.distance.toFixed(2))
+          : null,
+    },
+    measuredAt: parsedData.timestamp,
+    foF2: parsedData.foF2,
+    muf: parsedData.mufd,
+    mufFactor: parsedData.mufFactor,
+    hF2: parsedData.hF2,
+    foEs: parsedData.foEs,
+    confidence: parsedData.confidence,
+    ageMinutes: parsedData.ageMinutes,
+    freshness: parsedData.freshness,
+  };
+}
+
 /*
  * Restauramos el último dato válido cuando se carga el controlador.
  */
-loadPersistentCache();
+loadPersistentCache('giro');
+loadPersistentCache('dias');
 
 function calculateDistance(
   lat1,
@@ -420,11 +585,10 @@ function calculateDistance(
     ) /
     180;
 
+  const longitudeDifference =
+    ((lon2 - lon1 + 540) % 360) - 180;
   const dLon =
-    (
-      (lon2 - lon1) *
-      Math.PI
-    ) /
+    (longitudeDifference * Math.PI) /
     180;
 
   const a =
@@ -983,13 +1147,174 @@ function parseGiroResponse(
   );
 }
 
+async function fetchGiroMeasurement(station) {
+  const startedAt = Date.now();
+  const now = new Date();
+  const fromDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const params = {
+    ursiCode: station.ursi,
+    charName: 'foF2,foEs,MUF(D),M(D),h`F2',
+    DMUF: 3000,
+    fromDate: formatGiroDate(fromDate),
+    toDate: formatGiroDate(now),
+  };
+
+  logger.info('GIRO request URL', {
+    provider: 'giro',
+    station: station.ursi,
+    url: `${GIRO_BASE_URL}?${new URLSearchParams(params).toString()}`,
+  });
+
+  const response = await axios.get(GIRO_BASE_URL, {
+    params,
+    timeout: 10000,
+  });
+
+  if (response.status !== 200) {
+    const error = new Error(`GIRO returned HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  logger.info('GIRO response received', {
+    provider: 'giro',
+    station: station.ursi,
+    status: response.status,
+    dataLength: typeof response.data === 'string' ? response.data.length : null,
+  });
+
+  try {
+    const measurement = parseGiroResponse(response.data);
+    logger.info('GIRO measurement received', {
+      provider: 'giro',
+      station: station.ursi,
+      responseTimeMs: Date.now() - startedAt,
+      measuredAt: measurement.timestamp,
+      ageMinutes: measurement.ageMinutes,
+      foF2: measurement.foF2,
+      muf: measurement.mufd,
+      mufFactor: measurement.mufFactor,
+    });
+    return measurement;
+  } catch (error) {
+    logger.error('Failed to parse GIRO response', {
+      provider: 'giro',
+      station: station.ursi,
+      error: error.message,
+      snippet: typeof response.data === 'string'
+        ? response.data.slice(0, 2000)
+        : String(response.data),
+    });
+    throw error;
+  }
+}
+
+async function findRecentDiasStation(lat, lon) {
+  const candidates = getDiasCandidates(lat, lon);
+  const candidatesInRange = candidates.filter(
+    (candidate) => candidate.distance <= AUTO_MAX_DISTANCE_KM
+  );
+
+  for (const candidate of candidates) {
+    logger.info('Evaluated automatic DIAS station candidate', {
+      selectionMode: 'auto',
+      provider: 'dias',
+      station: candidate.ursi,
+      distanceKm: Number(candidate.distance.toFixed(2)),
+      withinMaxDistance: candidate.distance <= AUTO_MAX_DISTANCE_KM,
+      maxDistanceKm: AUTO_MAX_DISTANCE_KM,
+    });
+  }
+
+  for (const candidate of candidatesInRange.slice(0, AUTO_MAX_ATTEMPTS)) {
+    const cachedData = getCachedData(candidate, {}, 'dias');
+    if (cachedData) {
+      if (isObservationWithinAge(cachedData, MAX_OBSERVATION_AGE_MINUTES)) {
+        logger.info('Selected automatic DIAS station from cache', {
+          selectionMode: 'auto',
+          provider: 'dias',
+          station: candidate.ursi,
+          distanceKm: Number(candidate.distance.toFixed(2)),
+          ageMinutes: cachedData.ageMinutes,
+        });
+        return { station: candidate, data: cachedData, cached: true };
+      }
+
+      logger.warn('Discarded cached DIAS candidate with old observation', {
+        selectionMode: 'auto',
+        provider: 'dias',
+        station: candidate.ursi,
+        distanceKm: Number(candidate.distance.toFixed(2)),
+        ageMinutes: cachedData.ageMinutes,
+        maxAgeMinutes: MAX_OBSERVATION_AGE_MINUTES,
+      });
+    }
+
+    try {
+      const data = await fetchProviderMeasurement('dias', candidate);
+      if (!isObservationWithinAge(data, MAX_OBSERVATION_AGE_MINUTES)) {
+        const error = new diasService.DiasError(
+          'DIAS observation exceeds automatic selection age limit',
+          { code: 'DIAS_AUTO_OBSERVATION_TOO_OLD' }
+        );
+        error.ageMinutes = data.ageMinutes;
+        throw error;
+      }
+
+      logger.info('Selected automatic DIAS station', {
+        selectionMode: 'auto',
+        provider: 'dias',
+        station: candidate.ursi,
+        distanceKm: Number(candidate.distance.toFixed(2)),
+        ageMinutes: data.ageMinutes,
+      });
+      return { station: candidate, data, cached: false };
+    } catch (error) {
+      logger.warn('Skipped automatic DIAS station candidate', {
+        selectionMode: 'auto',
+        provider: 'dias',
+        station: candidate.ursi,
+        distanceKm: Number(candidate.distance.toFixed(2)),
+        ageMinutes: error.ageMinutes ?? null,
+        code: error.code ?? null,
+        reason: error.message,
+      });
+    }
+  }
+
+  if (candidatesInRange.length > AUTO_MAX_ATTEMPTS) {
+    logger.warn('Automatic DIAS candidate attempt limit reached', {
+      selectionMode: 'auto',
+      maxAttempts: AUTO_MAX_ATTEMPTS,
+      candidatesInRange: candidatesInRange.length,
+    });
+  }
+
+  return {
+    candidatesInRange: candidatesInRange.length,
+    attempts: Math.min(candidatesInRange.length, AUTO_MAX_ATTEMPTS),
+  };
+}
+
 exports.getHFData =
   async (
     req,
     res
   ) => {
+    const providerConfig = getConfiguredProvider();
+
+    if (!providerConfig) {
+      return res.status(500).json({
+        error: 'Invalid IONOSPHERE_PROVIDER or IONOSPHERE_PREFERRED_PROVIDER configuration',
+      });
+    }
+
     logger.info(
-      '➡️ Received GET request /api/ionosphere/hf'
+      'Received GET request /api/ionosphere/hf',
+      {
+        provider: providerConfig.mode,
+        preferredProvider: providerConfig.preferredProvider,
+      }
     );
 
     /*
@@ -998,6 +1323,10 @@ exports.getHFData =
      */
     let nearestStation =
       null;
+    let providerPlan = [];
+    let selectionMode = 'manual';
+    let userCoordinates = null;
+    const providerErrors = [];
 
     try {
       const {
@@ -1005,6 +1334,8 @@ exports.getHFData =
         lon,
         station,
       } = req.query;
+      const hasManualStation = Boolean(station);
+      selectionMode = hasManualStation ? 'manual' : 'auto';
 
       const stationId =
         Array.isArray(
@@ -1154,6 +1485,11 @@ exports.getHFData =
               : lon
           );
 
+        userCoordinates = {
+          lat: userLat,
+          lon: userLon,
+        };
+
         if (
           !isValidCoordinates(
             userLat,
@@ -1211,370 +1547,220 @@ exports.getHFData =
         );
       }
 
-      /*
-       * Caché normal: durante los primeros 15 minutos no volvemos
-       * a consultar GIRO.
-       */
-      const cachedResponse =
-        getCachedData(
-          nearestStation
-        );
-
       if (
-        cachedResponse
+        !hasManualStation &&
+        ['hybrid', 'dias'].includes(providerConfig.mode)
       ) {
-        logger.info(
-          'Serving GIRO data from cache',
-          {
-            station:
-              nearestStation.name,
-
-            cacheAgeSeconds:
-              cachedResponse.cacheAgeSeconds,
-
-            ageMinutes:
-              cachedResponse.ageMinutes,
-
-            freshness:
-              cachedResponse.freshness,
-
-            measuredAt:
-              cachedResponse.measuredAt,
-          }
+        const diasSelection = await findRecentDiasStation(
+          userCoordinates.lat,
+          userCoordinates.lon
         );
 
-        return res.json(
-          buildCachedResponse(
-            cachedResponse,
-            nearestStation
-          )
-        );
-      }
+        if (diasSelection.station) {
+          nearestStation = diasSelection.station;
 
-      const now =
-        new Date();
-
-      /*
-       * Buscar hasta 24 horas atrás para obtener la última
-       * medición disponible de la estación.
-       */
-      const fromDate =
-        new Date(
-          now.getTime() -
-            24 *
-              60 *
-              60 *
-              1000
-        );
-
-      const params = {
-        ursiCode:
-          nearestStation.ursi,
-
-        charName:
-          'foF2,foEs,MUF(D),M(D),h`F2',
-
-        DMUF:
-          3000,
-
-        fromDate:
-          formatGiroDate(
-            fromDate
-          ),
-
-        toDate:
-          formatGiroDate(
-            now
-          ),
-      };
-
-      const queryString =
-        new URLSearchParams(
-          params
-        ).toString();
-
-      logger.info(
-        'GIRO request URL',
-        {
-          url:
-            `${GIRO_BASE_URL}?${queryString}`,
-        }
-      );
-
-      const giroResponse =
-        await axios.get(
-          GIRO_BASE_URL,
-          {
-            params,
-
-            timeout:
-              10000,
-          }
-        );
-
-      logger.info(
-        'GIRO response received',
-        {
-          station:
-            nearestStation.name,
-
-          ursiCode:
-            nearestStation.ursi,
-
-          status:
-            giroResponse.status,
-
-          dataLength:
-            typeof giroResponse.data ===
-            'string'
-              ? giroResponse.data.length
-              : null,
-        }
-      );
-
-      let parsedData;
-
-      try {
-        parsedData =
-          parseGiroResponse(
-            giroResponse.data
-          );
-      } catch (err) {
-        /*
-         * Guardamos un fragmento para poder diagnosticar cambios
-         * de formato de GIRO.
-         */
-        const snippet =
-          typeof giroResponse.data ===
-          'string'
-            ? giroResponse.data.slice(
-                0,
-                2000
-              )
-            : String(
-                giroResponse.data
-              );
-
-        logger.error(
-          'Failed to parse GIRO response',
-          {
-            station:
-              nearestStation.name,
-
-            ursiCode:
-              nearestStation.ursi,
-
-            error:
-              err.message,
-
-            snippet,
-          }
-        );
-
-        throw err;
-      }
-
-      const response = {
-        cached:
-          false,
-
-        station: {
-          ursiCode:
-            nearestStation.ursi,
-
-          name:
-            nearestStation.name,
-
-          distanceKm:
-            nearestStation.distance !=
-            null
-              ? Number(
-                  nearestStation.distance.toFixed(
-                    2
-                  )
-                )
-              : null,
-        },
-
-        measuredAt:
-          parsedData.timestamp,
-
-        foF2:
-          parsedData.foF2,
-
-        muf:
-          parsedData.mufd,
-
-        mufFactor:
-          parsedData.mufFactor,
-
-        hF2:
-          parsedData.hF2,
-
-        foEs:
-          parsedData.foEs,
-
-        confidence:
-          parsedData.confidence,
-
-        ageMinutes:
-          parsedData.ageMinutes,
-
-        freshness:
-          parsedData.freshness,
-      };
-
-      /*
-       * Guarda en RAM y en disco.
-       */
-      saveCachedData(
-        nearestStation,
-        response
-      );
-
-      logger.info(
-        'Response sent for /api/ionosphere/hf',
-        {
-          station:
-            nearestStation.name,
-
-          foF2:
-            parsedData.foF2,
-
-          muf:
-            parsedData.mufd,
-
-          mufFactor:
-            parsedData.mufFactor,
-
-          cached:
-            false,
-        }
-      );
-
-      return res.json(
-        response
-      );
-    } catch (error) {
-      /*
-       * Si GIRO falla, recuperamos el último dato válido.
-       *
-       * Puede proceder de:
-       *
-       * - la memoria del proceso actual;
-       * - giro-cache.json restaurado tras un reinicio.
-       */
-      const staleCachedResponse =
-        nearestStation
-          ? getCachedData(
+          if (diasSelection.cached) {
+            return res.json(buildCachedResponse(
+              diasSelection.data,
               nearestStation,
-              {
-                allowStale:
-                  true,
-              }
-            )
-          : null;
-
-      if (
-        staleCachedResponse
-      ) {
-        logger.warn(
-          'GIRO unavailable; serving last cached data',
-          {
-            station:
-              nearestStation.name,
-
-            ursiCode:
-              nearestStation.ursi,
-
-            cacheAgeSeconds:
-              staleCachedResponse.cacheAgeSeconds,
-
-            ageMinutes:
-              staleCachedResponse.ageMinutes,
-
-            freshness:
-              staleCachedResponse.freshness,
-
-            measuredAt:
-              staleCachedResponse.measuredAt,
-
-            giroError:
-              error.message,
-
-            giroStatus:
-              error.response
-                ?.status ??
-              null,
+              { selectionMode }
+            ));
           }
-        );
 
-        /*
-         * Seguimos devolviendo 200 para mantener compatible la APK
-         * actual.
-         */
-        return res.json(
-          buildCachedResponse(
-            staleCachedResponse,
+          const response = buildProviderResponse(
             nearestStation,
-            {
-              sourceStatus:
-                'unavailable',
-            }
-          )
-        );
+            diasSelection.data,
+            'dias',
+            selectionMode
+          );
+          saveCachedData(nearestStation, response, 'dias');
+          return res.json(response);
+        }
+
+        if (providerConfig.mode === 'dias') {
+          return res.status(503).json({
+            error: 'No recent DIAS observation found within the configured radius',
+            provider: 'dias',
+            selectionMode,
+            maxDistanceKm: AUTO_MAX_DISTANCE_KM,
+            maxObservationAgeMinutes: MAX_OBSERVATION_AGE_MINUTES,
+            candidatesInRange: diasSelection.candidatesInRange,
+            attempts: diasSelection.attempts,
+          });
+        }
+
+        logger.warn('No recent DIAS station found; using nearest GIRO station', {
+          selectionMode,
+          fallbackProvider: 'giro',
+          station: nearestStation.ursi,
+          distanceKm: Number(nearestStation.distance.toFixed(2)),
+          candidatesInRange: diasSelection.candidatesInRange,
+          attempts: diasSelection.attempts,
+        });
+        providerPlan = ['giro'];
       }
 
-      /*
-       * Fallos HTTP, DNS, timeout, conexión reseteada, etc.
-       * Son fallos de GIRO, no errores internos de DXSun.
-       */
+      if (providerPlan.length === 0) {
+        providerPlan = getProviderPlan(providerConfig, nearestStation);
+      }
+      logger.info('Ionosphere provider plan selected', {
+        mode: providerConfig.mode,
+        preferredProvider: providerConfig.preferredProvider,
+        providers: providerPlan,
+        station: nearestStation.name,
+        ursiCode: nearestStation.ursi,
+        selectionMode,
+      });
+
       if (
-        axios.isAxiosError(
-          error
-        )
+        providerConfig.mode === 'dias' &&
+        !diasService.SUPPORTED_STATIONS.has(nearestStation.ursi.toUpperCase())
       ) {
-        logger.error(
-          'GIRO API error',
-          {
-            status:
-              error.response
-                ?.status ??
-              null,
+        logger.warn('Requested station is not supported by DIAS', {
+          provider: 'dias',
+          ursiCode: nearestStation.ursi,
+        });
 
-            statusText:
-              error.response
-                ?.statusText ??
-              null,
+        return res.status(422).json({
+          error: `DIAS does not support station ${nearestStation.ursi}`,
+          provider: 'dias',
+          station: nearestStation.ursi,
+          supportedStations: [...diasService.SUPPORTED_STATIONS],
+        });
+      }
 
-            requestUrl:
-              error.config
-                ?.url,
-
-            requestParams:
-              error.config
-                ?.params,
-
-            data:
-              error.response
-                ?.data ??
-              null,
-
-            error:
-              error.message,
-
-            code:
-              error.code ??
-              null,
-          }
+      for (const activeProvider of providerPlan) {
+        const cachedResponse = getCachedData(
+          nearestStation,
+          {},
+          activeProvider
         );
 
-        return res
-          .status(503)
-          .json({
-            error:
-              'GIRO service temporarily unavailable',
+        if (cachedResponse) {
+          logger.info('Serving ionosphere data from cache', {
+            provider: cachedResponse.source,
+            mode: providerConfig.mode,
+            selectionMode,
+            station: nearestStation.name,
+            ursiCode: nearestStation.ursi,
+            cacheAgeSeconds: cachedResponse.cacheAgeSeconds,
+            ageMinutes: cachedResponse.ageMinutes,
+            freshness: cachedResponse.freshness,
+            measuredAt: cachedResponse.measuredAt,
           });
+
+          return res.json(buildCachedResponse(
+            cachedResponse,
+            nearestStation,
+            { selectionMode }
+          ));
+        }
+
+        const requestStartedAt = Date.now();
+
+        try {
+          const parsedData = await fetchProviderMeasurement(activeProvider, nearestStation);
+          const response = buildProviderResponse(
+            nearestStation,
+            parsedData,
+            activeProvider,
+            selectionMode
+          );
+
+          saveCachedData(nearestStation, response, activeProvider);
+          logger.info('Response sent for /api/ionosphere/hf', {
+            provider: activeProvider,
+            mode: providerConfig.mode,
+            selectionMode,
+            fallbackUsed: providerErrors.length > 0 || (
+              providerConfig.mode === 'hybrid' &&
+              selectionMode === 'auto' &&
+              activeProvider === 'giro'
+            ),
+            station: nearestStation.name,
+            ursiCode: nearestStation.ursi,
+            responseTimeMs: Date.now() - requestStartedAt,
+            measuredAt: response.measuredAt,
+            ageMinutes: response.ageMinutes,
+            foF2: response.foF2,
+            muf: response.muf,
+            mufFactor: response.mufFactor,
+            cached: false,
+          });
+
+          return res.json(response);
+        } catch (error) {
+          providerErrors.push({ provider: activeProvider, error });
+          logger.warn('Ionosphere provider attempt failed', {
+            provider: activeProvider,
+            mode: providerConfig.mode,
+            station: nearestStation.name,
+            ursiCode: nearestStation.ursi,
+            responseTimeMs: Date.now() - requestStartedAt,
+            status: error.response?.status ?? error.status ?? null,
+            code: error.code ?? null,
+            error: error.message,
+          });
+        }
+      }
+
+      const lastProviderError = providerErrors[providerErrors.length - 1]?.error;
+      if (lastProviderError) {
+        throw lastProviderError;
+      }
+
+      throw new Error('No ionosphere provider was available');
+    } catch (error) {
+      const staleCandidates = nearestStation
+        ? providerPlan
+            .map((cachedProvider) => getCachedData(
+              nearestStation,
+              { allowStale: true },
+              cachedProvider
+            ))
+            .filter(Boolean)
+            .sort((left, right) => left.ageMinutes - right.ageMinutes)
+        : [];
+      const staleCachedResponse = staleCandidates[0] || null;
+
+      if (staleCachedResponse) {
+        logger.warn('Serving stale ionosphere cache after provider failures', {
+          source: staleCachedResponse.source,
+          mode: providerConfig.mode,
+          selectionMode,
+          providersTried: providerErrors.map(({ provider: failedProvider }) => failedProvider),
+          station: nearestStation.ursi,
+          cacheAgeSeconds: staleCachedResponse.cacheAgeSeconds,
+          ageMinutes: staleCachedResponse.ageMinutes,
+          freshness: staleCachedResponse.freshness,
+          measuredAt: staleCachedResponse.measuredAt,
+        });
+
+        return res.json(buildCachedResponse(
+          staleCachedResponse,
+          nearestStation,
+          { sourceStatus: 'unavailable', selectionMode }
+        ));
+      }
+
+      if (providerErrors.length > 0) {
+        logger.error('All ionosphere provider attempts failed', {
+          mode: providerConfig.mode,
+          station: nearestStation?.ursi ?? null,
+          providers: providerErrors.map(({ provider: failedProvider, error: providerError }) => ({
+            provider: failedProvider,
+            status: providerError.response?.status ?? providerError.status ?? null,
+            code: providerError.code ?? null,
+            error: providerError.message,
+          })),
+        });
+
+        return res.status(503).json({
+          error: providerConfig.mode === 'hybrid'
+            ? 'Ionosphere providers temporarily unavailable'
+            : `${providerPlan[0].toUpperCase()} service temporarily unavailable`,
+          providersTried: providerPlan,
+        });
       }
 
       logger.error(
@@ -1584,24 +1770,6 @@ exports.getHFData =
             error.message,
         }
       );
-
-      /*
-       * GIRO también puede devolver HTTP 200 pero una respuesta
-       * vacía o no interpretable.
-       */
-      if (
-        error.message ===
-          'Empty GIRO response' ||
-        error.message ===
-          'No valid ionospheric measurement found in GIRO response'
-      ) {
-        return res
-          .status(503)
-          .json({
-            error:
-              'GIRO service temporarily unavailable',
-          });
-      }
 
       /*
        * Solo dejamos 500 para errores realmente internos de DXSun.
@@ -1621,6 +1789,10 @@ exports.getStations =
     req,
     res
   ) => {
+    const mode =
+      (process.env.IONOSPHERE_PROVIDER || 'hybrid')
+        .trim()
+        .toLowerCase();
     const stationList =
       stations.map(
         ({
