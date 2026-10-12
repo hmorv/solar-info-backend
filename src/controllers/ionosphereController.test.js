@@ -126,6 +126,13 @@ test('IONOSPHERE_PROVIDER=dias calls DIAS and keeps the existing response contra
       assert.ok(Object.hasOwn(response.body, key), `missing ${key}`);
     }
     assert.equal(response.body.confidence, null);
+    assert.deepEqual(response.body.parameterTimestamps, {
+      foF2: response.body.measuredAt,
+      muf: response.body.measuredAt,
+      mufFactor: response.body.measuredAt,
+      hF2: response.body.measuredAt,
+      foEs: response.body.measuredAt,
+    });
     assert.equal(requestedUrls.length, 1);
     assert.match(requestedUrls[0], /electron\.space\.noa\.gr\/ionostream/);
   } finally {
@@ -489,6 +496,13 @@ test('automatic selection serves a valid recent DIAS cache entry without a provi
             source: 'dias',
             station: { ursiCode: 'RO041', name: 'ROME', distanceKm: null },
             measuredAt: new Date(Date.now() - 5 * 60000).toISOString(),
+            parameterTimestamps: {
+              foF2: new Date(Date.now() - 5 * 60000).toISOString(),
+              muf: new Date(Date.now() - 5 * 60000).toISOString(),
+              mufFactor: new Date(Date.now() - 5 * 60000).toISOString(),
+              hF2: new Date(Date.now() - 5 * 60000).toISOString(),
+              foEs: new Date(Date.now() - 5 * 60000).toISOString(),
+            },
             foF2: 6.5,
             muf: 24,
             mufFactor: 3.5,
@@ -535,6 +549,13 @@ test('automatic selection does not treat a cached DIAS observation over 30 minut
             source: 'dias',
             station: { ursiCode: 'RO041', name: 'ROME', distanceKm: null },
             measuredAt: new Date(Date.now() - 40 * 60000).toISOString(),
+            parameterTimestamps: {
+              foF2: new Date(Date.now() - 40 * 60000).toISOString(),
+              muf: new Date(Date.now() - 40 * 60000).toISOString(),
+              mufFactor: new Date(Date.now() - 40 * 60000).toISOString(),
+              hF2: new Date(Date.now() - 40 * 60000).toISOString(),
+              foEs: new Date(Date.now() - 40 * 60000).toISOString(),
+            },
             foF2: 6.5,
             muf: 24,
             mufFactor: 3.5,
@@ -564,6 +585,61 @@ test('automatic selection does not treat a cached DIAS observation over 30 minut
     assert.equal(response.body.station.ursiCode, 'RO041');
     assert.equal(response.body.cached, false);
     assert.equal(requestedUrls.length, 2);
+  } finally {
+    axios.get = originalGet;
+    state.restore();
+  }
+});
+
+test('DIAS cache expires parameters independently from the cache storage time', async () => {
+  const state = createController('hybrid', ({ diasCacheFile }) => {
+    const cachedAt = new Date().toISOString();
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60000).toISOString();
+    const fortyMinutesAgo = new Date(Date.now() - 40 * 60000).toISOString();
+    fs.writeFileSync(diasCacheFile, JSON.stringify({
+      version: 1,
+      stations: {
+        EB040: {
+          cachedAt,
+          data: {
+            source: 'dias',
+            station: { ursiCode: 'EB040', name: 'ROQUETES', distanceKm: null },
+            measuredAt: fiveMinutesAgo,
+            parameterTimestamps: {
+              foF2: fiveMinutesAgo,
+              muf: fiveMinutesAgo,
+              mufFactor: fiveMinutesAgo,
+              hF2: fiveMinutesAgo,
+              foEs: fortyMinutesAgo,
+            },
+            foF2: 6.5,
+            muf: 24,
+            mufFactor: 3.5,
+            hF2: 250,
+            foEs: 2.2,
+            confidence: null,
+            ageMinutes: 5,
+            freshness: 'fresh',
+          },
+        },
+      },
+    }));
+  });
+  const originalGet = axios.get;
+  let requestCount = 0;
+  axios.get = async () => {
+    requestCount++;
+    throw new Error('recent cached parameters should be sufficient');
+  };
+
+  try {
+    const response = await invoke(state.controller, { station: 'EB040' });
+    assert.equal(response.body.cached, true);
+    assert.equal(response.body.foF2, 6.5);
+    assert.equal(response.body.foEs, null);
+    assert.equal(response.body.parameterTimestamps.foEs, null);
+    assert.ok(response.body.parameterTimestamps.foF2);
+    assert.equal(requestCount, 0);
   } finally {
     axios.get = originalGet;
     state.restore();
@@ -680,10 +756,16 @@ test('legacy giro-cache.json entries remain GIRO-only and retain their format', 
 test('hybrid serves the newest provider-specific stale cache when both providers fail', async () => {
   const state = createController('hybrid', ({ giroCacheFile, diasCacheFile }) => {
     const cachedAt = new Date(Date.now() - 20 * 60000).toISOString();
-    const createData = (ageMinutes, source) => ({
+    const createData = (ageMinutes, source) => {
+      const measuredAt = new Date(Date.now() - ageMinutes * 60000).toISOString();
+      const parameterTimestamps = source === 'dias'
+        ? Object.fromEntries(['foF2', 'muf', 'mufFactor', 'hF2', 'foEs'].map((field) => [field, measuredAt]))
+        : undefined;
+      return {
       source,
       station: { ursiCode: 'EB040', name: 'ROQUETES', distanceKm: null },
-      measuredAt: new Date(Date.now() - ageMinutes * 60000).toISOString(),
+      measuredAt,
+      ...(parameterTimestamps ? { parameterTimestamps } : {}),
       foF2: source === 'dias' ? 6.5 : 6.2,
       muf: 24,
       mufFactor: 3.5,
@@ -692,7 +774,8 @@ test('hybrid serves the newest provider-specific stale cache when both providers
       confidence: source === 'dias' ? null : 4,
       ageMinutes,
       freshness: 'old',
-    });
+    };
+    };
     const writeCache = (file, source, ageMinutes) => fs.writeFileSync(file, JSON.stringify({
       version: 1,
       stations: {
@@ -700,8 +783,8 @@ test('hybrid serves the newest provider-specific stale cache when both providers
       },
     }));
 
-    writeCache(diasCacheFile, 'dias', 240);
-    writeCache(giroCacheFile, 'giro', 300);
+    writeCache(diasCacheFile, 'dias', 25);
+    writeCache(giroCacheFile, 'giro', 28);
   });
   const originalGet = axios.get;
   let requestCount = 0;
@@ -718,7 +801,7 @@ test('hybrid serves the newest provider-specific stale cache when both providers
     assert.equal(response.body.sourceStatus, 'unavailable');
     assert.equal(response.body.cached, true);
     assert.equal(response.body.foF2, 6.5);
-    assert.equal(response.body.freshness, 'old');
+    assert.equal(response.body.ageMinutes, 25);
   } finally {
     axios.get = originalGet;
     state.restore();

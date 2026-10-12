@@ -129,6 +129,43 @@ function getCacheKey(station) {
   return station.ursi.toUpperCase();
 }
 
+function filterFreshDiasParameters(data, nowMs = Date.now()) {
+  if (!data?.parameterTimestamps) {
+    return null;
+  }
+
+  const maxAgeMinutes = getPositiveEnvironmentNumber(
+    'DIAS_PARAMETER_MAX_AGE_MINUTES',
+    30
+  );
+  const filtered = {
+    ...data,
+    parameterTimestamps: { ...data.parameterTimestamps },
+  };
+  const fields = ['foF2', 'muf', 'mufFactor', 'hF2', 'foEs'];
+
+  for (const field of fields) {
+    const timestamp = filtered.parameterTimestamps[field];
+    const measuredAtMs = timestamp ? new Date(timestamp).getTime() : NaN;
+    const ageMs = nowMs - measuredAtMs;
+
+    if (
+      filtered[field] === null ||
+      filtered[field] === undefined ||
+      !Number.isFinite(measuredAtMs) ||
+      ageMs < 0 ||
+      ageMs > maxAgeMinutes * 60 * 1000
+    ) {
+      filtered[field] = null;
+      filtered.parameterTimestamps[field] = null;
+    }
+  }
+
+  return fields.some((field) => filtered[field] !== null)
+    ? filtered
+    : null;
+}
+
 function fetchProviderMeasurement(provider, station) {
   const requestKey = `${provider}:${getCacheKey(station)}`;
   const inFlightRequest = providerRequestsInFlight.get(requestKey);
@@ -461,7 +498,7 @@ function getCachedData(
   /*
    * No modificamos directamente entry.data.
    */
-  return {
+  const cachedData = {
     ...entry.data,
 
     ageMinutes,
@@ -478,6 +515,17 @@ function getCachedData(
         1000
       ),
   };
+
+  if (provider === 'dias') {
+    const filteredDiasData = filterFreshDiasParameters(cachedData, nowMs);
+    if (!filteredDiasData) {
+      return null;
+    }
+
+    return filteredDiasData;
+  }
+
+  return cachedData;
 }
 
 function saveCachedData(
@@ -561,6 +609,9 @@ function buildProviderResponse(
     confidence: parsedData.confidence,
     ageMinutes: parsedData.ageMinutes,
     freshness: parsedData.freshness,
+    ...(parsedData.parameterTimestamps
+      ? { parameterTimestamps: parsedData.parameterTimestamps }
+      : {}),
   };
 }
 
